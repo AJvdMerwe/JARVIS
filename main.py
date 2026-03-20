@@ -54,7 +54,7 @@ _BANNER = """
 ║          Virtual Personal Assistant  v1.0                    ║
 ║  Agents: Code · News · Search · Documents                    ║
 ║  Backend: {backend:<10}  Voice: {voice}                      ║
-║  Type  :quit  to exit  |  :help  for commands               ║
+║  Type  :quit  to exit  |  :help  for commands                ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 

@@ -35,7 +35,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN pip install --upgrade pip wheel setuptools
 
 # Install Python dependencies (cached layer if requirements.txt unchanged)
-COPY requirements.txt .
+COPY ../requirements.txt .
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
 

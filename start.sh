@@ -94,8 +94,8 @@ done
 print_banner() {
   echo -e "${CYAN}${BOLD}"
   echo "  ╔══════════════════════════════════════════════════════════╗"
-  echo "  ║         Virtual Personal Assistant  v1.0                ║"
-  echo "  ║  Code · News · Search · Documents · Voice               ║"
+  echo "  ║         Virtual Personal Assistant  v1.0                 ║"
+  echo "  ║  Code · News · Search · Documents · Voice                ║"
   echo "  ╚══════════════════════════════════════════════════════════╝"
   echo -e "${RESET}"
 }

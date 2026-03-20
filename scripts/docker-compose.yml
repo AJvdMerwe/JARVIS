@@ -1,0 +1,105 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  Virtual Personal Assistant – docker-compose.yml
+#
+#  Services:
+#    assistant  – the main application
+#    ollama     – local LLM server (CPU by default; see GPU profile below)
+#
+#  Usage:
+#    docker compose up -d ollama     # start Ollama first
+#    docker compose run --rm assistant bash scripts/setup_ollama.sh
+#    docker compose run --rm -it assistant chat
+#
+#  With GPU (uncomment the 'profiles' section under ollama):
+#    docker compose --profile gpu up -d ollama
+# ─────────────────────────────────────────────────────────────────────────────
+
+version: "3.9"
+
+services:
+
+  # ── Ollama LLM server ──────────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: va_ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    environment:
+      - OLLAMA_KEEP_ALIVE=24h
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+    # ── GPU support (uncomment to enable NVIDIA GPU passthrough) ──────────
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  # ── Virtual Assistant ──────────────────────────────────────────────────────
+  assistant:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: va_assistant
+    depends_on:
+      ollama:
+        condition: service_healthy
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./data:/app/data          # persist vector store, uploads, logs
+      - ./.env:/app/.env:ro       # mount local .env read-only
+    environment:
+      - LLM_BACKEND=ollama
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - VOICE_ENABLED=false       # voice requires /dev/snd passthrough
+      - VECTOR_STORE_PATH=/app/data/vector_store
+      - UPLOADS_PATH=/app/data/uploads
+      - LOG_PATH=/app/data/logs/assistant.log
+
+  # ── vLLM server (optional, GPU required) ──────────────────────────────────
+  vllm:
+    image: vllm/vllm-openai:latest
+    container_name: va_vllm
+    profiles: ["gpu"]             # only started with: docker compose --profile gpu up
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - huggingface_cache:/root/.cache/huggingface
+    command: >
+      --model mistralai/Mistral-7B-Instruct-v0.2
+      --host 0.0.0.0
+      --port 8000
+      --max-model-len 4096
+      --dtype auto
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+      start_period: 120s
+
+volumes:
+  ollama_models:
+    name: va_ollama_models
+  huggingface_cache:
+    name: va_huggingface_cache

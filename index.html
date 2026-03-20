@@ -1,0 +1,647 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Virtual Assistant</title>
+<style>
+  :root {
+    --bg:         #0f1117;
+    --bg2:        #1a1d27;
+    --bg3:        #22263a;
+    --border:     #2e3250;
+    --accent:     #6366f1;
+    --accent-dim: #4f51c4;
+    --green:      #22c55e;
+    --amber:      #f59e0b;
+    --red:        #ef4444;
+    --blue:       #38bdf8;
+    --text:       #e2e8f0;
+    --text-dim:   #94a3b8;
+    --radius:     10px;
+    --font:       'Inter', 'Segoe UI', system-ui, sans-serif;
+    --mono:       'JetBrains Mono', 'Fira Code', monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: var(--font);
+    background: var(--bg);
+    color: var(--text);
+    height: 100vh;
+    display: flex;
+    overflow: hidden;
+  }
+
+  /* ── Sidebar ── */
+  #sidebar {
+    width: 260px;
+    min-width: 260px;
+    background: var(--bg2);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    padding: 16px;
+    gap: 12px;
+  }
+  #sidebar h1 { font-size: 15px; font-weight: 600; color: var(--text); }
+  #sidebar .sub { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
+
+  .agent-badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 10px; border-radius: 20px;
+    font-size: 11px; font-weight: 600;
+    background: var(--bg3); color: var(--text-dim);
+    border: 1px solid var(--border);
+    cursor: pointer; transition: all .15s;
+  }
+  .agent-badge:hover, .agent-badge.active {
+    background: var(--accent); color: #fff; border-color: var(--accent);
+  }
+  .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+
+  #agent-grid { display: flex; flex-wrap: wrap; gap: 6px; }
+
+  .sidebar-section { border-top: 1px solid var(--border); padding-top: 12px; }
+  .sidebar-section label { font-size: 11px; font-weight: 600; color: var(--text-dim); text-transform: uppercase; letter-spacing: .05em; }
+
+  #doc-list { margin-top: 8px; display: flex; flex-direction: column; gap: 4px; max-height: 200px; overflow-y: auto; }
+  .doc-item {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 8px; border-radius: 6px;
+    background: var(--bg3); font-size: 12px; color: var(--text);
+    cursor: pointer;
+  }
+  .doc-item:hover { background: var(--bg); }
+  .doc-item .doc-type {
+    padding: 1px 5px; border-radius: 3px; font-size: 10px;
+    font-weight: 700; background: var(--accent-dim); color: #fff;
+  }
+  .doc-item .doc-del {
+    margin-left: auto; color: var(--red); font-size: 13px;
+    cursor: pointer; opacity: .6;
+  }
+  .doc-item .doc-del:hover { opacity: 1; }
+
+  #upload-btn {
+    width: 100%; padding: 8px; border-radius: var(--radius);
+    background: var(--bg3); color: var(--text-dim);
+    border: 1px dashed var(--border); cursor: pointer;
+    font-size: 12px; transition: all .15s;
+  }
+  #upload-btn:hover { border-color: var(--accent); color: var(--accent); }
+  #file-input { display: none; }
+
+  #status-bar {
+    margin-top: auto;
+    font-size: 11px; color: var(--text-dim);
+    display: flex; flex-direction: column; gap: 4px;
+  }
+  .status-row { display: flex; justify-content: space-between; }
+  .status-dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; margin-right: 4px; }
+  .s-ok  { background: var(--green); }
+  .s-err { background: var(--red); }
+  .s-warn{ background: var(--amber); }
+
+  /* ── Main chat area ── */
+  #main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  #chat-header {
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px; color: var(--text-dim);
+    display: flex; align-items: center; gap: 12px;
+  }
+  #session-id { font-family: var(--mono); font-size: 11px; color: var(--text-dim); }
+  #clear-btn {
+    margin-left: auto; padding: 4px 10px; border-radius: 6px;
+    background: transparent; border: 1px solid var(--border);
+    color: var(--text-dim); font-size: 11px; cursor: pointer;
+  }
+  #clear-btn:hover { border-color: var(--red); color: var(--red); }
+
+  #messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+    scroll-behavior: smooth;
+  }
+
+  .msg { display: flex; gap: 12px; max-width: 860px; width: 100%; align-self: flex-start; }
+  .msg.user { align-self: flex-end; flex-direction: row-reverse; }
+
+  .avatar {
+    width: 32px; height: 32px; min-width: 32px;
+    border-radius: 50%; display: flex; align-items: center; justify-content: center;
+    font-size: 14px; font-weight: 700;
+  }
+  .avatar.user-av  { background: var(--accent); color: #fff; }
+  .avatar.agent-av { background: var(--bg3); color: var(--accent); border: 1px solid var(--border); }
+
+  .bubble {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 12px 16px;
+    font-size: 14px; line-height: 1.65;
+    max-width: 720px;
+  }
+  .msg.user .bubble { background: var(--accent-dim); border-color: transparent; }
+
+  .agent-label {
+    font-size: 10px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: .08em; color: var(--text-dim); margin-bottom: 6px;
+  }
+
+  .refs {
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border);
+    display: flex; flex-direction: column; gap: 4px;
+  }
+  .ref-item {
+    font-size: 11px; color: var(--blue);
+    display: flex; align-items: flex-start; gap: 6px; cursor: pointer;
+  }
+  .ref-num {
+    background: var(--bg3); border-radius: 4px;
+    padding: 1px 5px; font-family: var(--mono); font-size: 10px;
+    color: var(--text-dim); min-width: 20px; text-align: center;
+  }
+
+  /* code blocks inside bubbles */
+  .bubble pre {
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 12px; margin: 8px 0;
+    overflow-x: auto; font-family: var(--mono); font-size: 12px;
+    line-height: 1.5;
+  }
+  .bubble code { font-family: var(--mono); font-size: 12px; }
+  .bubble p { margin: 4px 0; }
+  .bubble h1,.bubble h2,.bubble h3 { margin: 10px 0 4px; }
+  .bubble ul,.bubble ol { padding-left: 20px; }
+  .bubble li { margin: 2px 0; }
+  .bubble strong { color: #fff; }
+  .bubble a { color: var(--blue); }
+
+  .cursor { display: inline-block; width: 2px; height: 14px; background: var(--accent); margin-left: 2px; animation: blink .7s step-end infinite; vertical-align: text-bottom; }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  .thinking {
+    display: flex; align-items: center; gap: 8px;
+    color: var(--text-dim); font-size: 13px; padding: 8px 0;
+  }
+  .thinking .dots span {
+    display: inline-block; width: 5px; height: 5px; border-radius: 50%;
+    background: var(--accent); margin: 0 2px;
+    animation: bounce 1.2s ease-in-out infinite;
+  }
+  .thinking .dots span:nth-child(2) { animation-delay: .2s; }
+  .thinking .dots span:nth-child(3) { animation-delay: .4s; }
+  @keyframes bounce { 0%,80%,100%{transform:scale(.6)} 40%{transform:scale(1)} }
+
+  /* ── Input bar ── */
+  #input-bar {
+    padding: 16px 20px;
+    border-top: 1px solid var(--border);
+    display: flex; gap: 10px; align-items: flex-end;
+  }
+  #query-input {
+    flex: 1; background: var(--bg2); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 10px 14px;
+    font-family: var(--font); font-size: 14px; color: var(--text);
+    resize: none; min-height: 44px; max-height: 140px;
+    line-height: 1.5; outline: none;
+    transition: border-color .15s;
+  }
+  #query-input:focus { border-color: var(--accent); }
+  #query-input::placeholder { color: var(--text-dim); }
+
+  #send-btn {
+    padding: 10px 18px; border-radius: var(--radius);
+    background: var(--accent); color: #fff;
+    border: none; cursor: pointer; font-size: 14px; font-weight: 600;
+    transition: background .15s; height: 44px;
+  }
+  #send-btn:hover { background: var(--accent-dim); }
+  #send-btn:disabled { background: var(--bg3); color: var(--text-dim); cursor: not-allowed; }
+
+  /* scrollbar */
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+  /* upload progress */
+  #upload-progress {
+    font-size: 11px; color: var(--text-dim);
+    padding: 4px 0; display: none;
+  }
+
+  /* toast */
+  #toast {
+    position: fixed; bottom: 80px; left: 50%; transform: translateX(-50%);
+    background: var(--bg3); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 8px 16px;
+    font-size: 13px; color: var(--text);
+    opacity: 0; pointer-events: none;
+    transition: opacity .3s;
+    z-index: 100;
+  }
+  #toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+
+<!-- ── Sidebar ─────────────────────────────────────────────────────────────── -->
+<aside id="sidebar">
+  <div>
+    <h1>Virtual Assistant</h1>
+    <div class="sub">Local AI · Fully private</div>
+  </div>
+
+  <div id="agent-grid">
+    <span class="agent-badge" data-intent="auto">✦ Auto</span>
+    <span class="agent-badge" data-intent="code">⌨ Code</span>
+    <span class="agent-badge" data-intent="news">📰 News</span>
+    <span class="agent-badge" data-intent="search">🔍 Search</span>
+    <span class="agent-badge" data-intent="document">📄 Docs</span>
+  </div>
+
+  <div class="sidebar-section">
+    <label>Knowledge Base</label>
+    <div id="doc-list"><div style="color:var(--text-dim);font-size:12px;padding:8px 0;">No documents yet.</div></div>
+    <div id="upload-progress">Uploading…</div>
+    <button id="upload-btn" onclick="document.getElementById('file-input').click()">
+      + Upload document (PDF, DOCX, XLSX, PPTX)
+    </button>
+    <input id="file-input" type="file" accept=".pdf,.docx,.xlsx,.xls,.pptx,.ppt" multiple>
+  </div>
+
+  <div id="status-bar">
+    <div class="status-row">
+      <span><span class="status-dot s-ok" id="conn-dot"></span>WebSocket</span>
+      <span id="conn-label">Connecting…</span>
+    </div>
+    <div class="status-row">
+      <span>Session</span>
+      <span id="session-id-status" style="font-family:var(--mono);font-size:10px"></span>
+    </div>
+    <div class="status-row">
+      <span>KB chunks</span>
+      <span id="kb-count">—</span>
+    </div>
+  </div>
+</aside>
+
+<!-- ── Main ────────────────────────────────────────────────────────────────── -->
+<main id="main">
+  <div id="chat-header">
+    <span>Session: <span id="session-id"></span></span>
+    <button id="clear-btn" onclick="clearSession()">Clear memory</button>
+  </div>
+
+  <div id="messages">
+    <div class="msg">
+      <div class="avatar agent-av">VA</div>
+      <div class="bubble">
+        <div class="agent-label">assistant</div>
+        Hello! I'm your local virtual assistant. I can:<br>
+        <ul style="margin-top:8px;">
+          <li><strong>Write, debug &amp; execute code</strong></li>
+          <li><strong>Fetch &amp; summarise news</strong></li>
+          <li><strong>Search the web</strong> (Wikipedia, DuckDuckGo)</li>
+          <li><strong>Chat with your documents</strong> (PDF, DOCX, XLSX, PPTX)</li>
+        </ul>
+        <br>Upload a document in the sidebar, or just start chatting!
+      </div>
+    </div>
+  </div>
+
+  <div id="input-bar">
+    <textarea id="query-input" placeholder="Ask anything… (Enter to send, Shift+Enter for newline)" rows="1"></textarea>
+    <button id="send-btn" onclick="sendMessage()">Send</button>
+  </div>
+</main>
+
+<div id="toast"></div>
+
+<script>
+// ── Config ───────────────────────────────────────────────────────────────────
+const API_BASE = window.location.origin;
+const WS_BASE  = API_BASE.replace(/^http/, 'ws');
+const SESSION  = 'sess-' + Math.random().toString(36).slice(2, 8);
+
+let ws          = null;
+let forcedIntent = 'auto';
+let pendingBubble = null;
+let pendingRefs   = [];
+
+// ── Init ─────────────────────────────────────────────────────────────────────
+document.getElementById('session-id').textContent = SESSION;
+document.getElementById('session-id-status').textContent = SESSION;
+connectWS();
+loadDocuments();
+loadHealth();
+
+// ── WebSocket ────────────────────────────────────────────────────────────────
+function connectWS() {
+  ws = new WebSocket(`${WS_BASE}/ws/${SESSION}`);
+
+  ws.onopen = () => {
+    setConnStatus(true);
+  };
+
+  ws.onclose = () => {
+    setConnStatus(false);
+    setTimeout(connectWS, 3000);
+  };
+
+  ws.onerror = () => setConnStatus(false);
+
+  ws.onmessage = (ev) => {
+    const msg = JSON.parse(ev.data);
+    handleWsMessage(msg);
+  };
+}
+
+function setConnStatus(ok) {
+  const dot = document.getElementById('conn-dot');
+  const lbl = document.getElementById('conn-label');
+  dot.className = 'status-dot ' + (ok ? 's-ok' : 's-err');
+  lbl.textContent = ok ? 'Connected' : 'Reconnecting…';
+}
+
+function handleWsMessage(msg) {
+  if (msg.type === 'start') {
+    removeThinking();
+    pendingBubble = createAgentBubble(msg.agent);
+    pendingRefs = [];
+  } else if (msg.type === 'token') {
+    if (pendingBubble) appendToken(pendingBubble, msg.content);
+  } else if (msg.type === 'reference') {
+    pendingRefs.push(msg.ref);
+  } else if (msg.type === 'done') {
+    if (pendingBubble) {
+      removeCursor(pendingBubble);
+      if (pendingRefs.length) attachRefs(pendingBubble, pendingRefs);
+    }
+    pendingBubble = null;
+    setSendEnabled(true);
+  } else if (msg.type === 'error') {
+    removeThinking();
+    addErrorMsg(msg.message);
+    setSendEnabled(true);
+  }
+}
+
+// ── Send ─────────────────────────────────────────────────────────────────────
+function sendMessage() {
+  const input = document.getElementById('query-input');
+  const query = input.value.trim();
+  if (!query || !ws || ws.readyState !== WebSocket.OPEN) return;
+
+  addUserBubble(query);
+  input.value = '';
+  input.style.height = 'auto';
+  addThinking();
+  setSendEnabled(false);
+
+  const payload = { query };
+  if (forcedIntent !== 'auto') payload.intent = forcedIntent;
+  ws.send(JSON.stringify(payload));
+}
+
+// ── DOM helpers ──────────────────────────────────────────────────────────────
+function addUserBubble(text) {
+  const msgs = document.getElementById('messages');
+  const msg  = document.createElement('div');
+  msg.className = 'msg user';
+  msg.innerHTML = `
+    <div class="avatar user-av">U</div>
+    <div class="bubble">${escHtml(text).replace(/\n/g,'<br>')}</div>`;
+  msgs.appendChild(msg);
+  scrollBottom();
+}
+
+function createAgentBubble(agentName) {
+  const msgs = document.getElementById('messages');
+  const msg  = document.createElement('div');
+  msg.className = 'msg';
+  const label = agentName.replace('_', ' ');
+  const content = document.createElement('div');
+  content.className = 'bubble';
+  content.innerHTML = `<div class="agent-label">${escHtml(label)}</div><span class="body-text"></span><span class="cursor"></span>`;
+  msg.innerHTML = `<div class="avatar agent-av">VA</div>`;
+  msg.appendChild(content);
+  msgs.appendChild(msg);
+  scrollBottom();
+  return content;
+}
+
+function appendToken(bubble, token) {
+  const bodyEl = bubble.querySelector('.body-text');
+  if (bodyEl) {
+    bodyEl.textContent += token;
+    scrollBottom();
+  }
+}
+
+function removeCursor(bubble) {
+  const cur = bubble.querySelector('.cursor');
+  if (cur) cur.remove();
+  // Render markdown-like formatting
+  const bodyEl = bubble.querySelector('.body-text');
+  if (bodyEl) {
+    bodyEl.outerHTML = renderMarkdown(bodyEl.textContent);
+  }
+}
+
+function attachRefs(bubble, refs) {
+  const refsDiv = document.createElement('div');
+  refsDiv.className = 'refs';
+  refs.forEach((ref, i) => {
+    const item = document.createElement('div');
+    item.className = 'ref-item';
+    item.innerHTML = `<span class="ref-num">${i+1}</span><span>${escHtml(ref)}</span>`;
+    item.onclick = () => { document.getElementById('query-input').value = `Tell me more about: ${ref}`; };
+    refsDiv.appendChild(item);
+  });
+  bubble.appendChild(refsDiv);
+  scrollBottom();
+}
+
+function addThinking() {
+  const msgs = document.getElementById('messages');
+  const div  = document.createElement('div');
+  div.id = 'thinking';
+  div.className = 'thinking';
+  div.innerHTML = `<div class="avatar agent-av" style="width:32px;height:32px;min-width:32px">VA</div>Thinking<div class="dots"><span></span><span></span><span></span></div>`;
+  msgs.appendChild(div);
+  scrollBottom();
+}
+
+function removeThinking() {
+  const el = document.getElementById('thinking');
+  if (el) el.remove();
+}
+
+function addErrorMsg(text) {
+  const msgs = document.getElementById('messages');
+  const div  = document.createElement('div');
+  div.className = 'msg';
+  div.innerHTML = `<div class="avatar agent-av" style="background:var(--red)">!</div><div class="bubble" style="border-color:var(--red);color:var(--red)">${escHtml(text)}</div>`;
+  msgs.appendChild(div);
+  scrollBottom();
+}
+
+function setSendEnabled(enabled) {
+  document.getElementById('send-btn').disabled = !enabled;
+}
+
+function scrollBottom() {
+  const msgs = document.getElementById('messages');
+  msgs.scrollTop = msgs.scrollHeight;
+}
+
+// ── Markdown renderer (lightweight) ─────────────────────────────────────────
+function renderMarkdown(text) {
+  let html = escHtml(text)
+    .replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>')
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*(.+?)\*/g, '<em>$1</em>')
+    .replace(/^## (.+)$/gm, '<h3>$1</h3>')
+    .replace(/^# (.+)$/gm, '<h2>$1</h2>')
+    .replace(/^- (.+)$/gm, '<li>$1</li>')
+    .replace(/(<li>.*<\/li>\n?)+/g, '<ul>$&</ul>')
+    .replace(/^\d+\. (.+)$/gm, '<li>$1</li>')
+    .replace(/\n\n/g, '</p><p>')
+    .replace(/\n/g, '<br>');
+  return `<span>${html}</span>`;
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ── Agent selector ───────────────────────────────────────────────────────────
+document.querySelectorAll('.agent-badge').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.agent-badge').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    forcedIntent = btn.dataset.intent;
+  });
+});
+document.querySelector('[data-intent="auto"]').classList.add('active');
+
+// ── Input auto-grow + Enter to send ─────────────────────────────────────────
+const textarea = document.getElementById('query-input');
+textarea.addEventListener('input', () => {
+  textarea.style.height = 'auto';
+  textarea.style.height = Math.min(textarea.scrollHeight, 140) + 'px';
+});
+textarea.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+});
+
+// ── Document management ──────────────────────────────────────────────────────
+async function loadDocuments() {
+  try {
+    const res = await fetch(`${API_BASE}/documents`);
+    const docs = await res.json();
+    renderDocList(docs);
+  } catch(e) {}
+}
+
+function renderDocList(docs) {
+  const list = document.getElementById('doc-list');
+  if (!docs.length) {
+    list.innerHTML = '<div style="color:var(--text-dim);font-size:12px;padding:8px 0;">No documents yet.</div>';
+    return;
+  }
+  list.innerHTML = docs.map(d => `
+    <div class="doc-item" onclick="chatAboutDoc('${escHtml(d.doc_title)}')">
+      <span class="doc-type">${d.doctype.toUpperCase()}</span>
+      <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(d.doc_title)}</span>
+      <span class="doc-del" onclick="event.stopPropagation();deleteDoc('${escHtml(d.doc_title)}')">✕</span>
+    </div>`).join('');
+}
+
+async function deleteDoc(title) {
+  if (!confirm(`Remove "${title}" from the knowledge base?`)) return;
+  try {
+    await fetch(`${API_BASE}/documents/${encodeURIComponent(title)}`, { method: 'DELETE' });
+    showToast(`Removed "${title}".`);
+    loadDocuments();
+  } catch(e) { showToast('Delete failed.'); }
+}
+
+function chatAboutDoc(title) {
+  forcedIntent = 'document';
+  document.querySelectorAll('.agent-badge').forEach(b => b.classList.remove('active'));
+  document.querySelector('[data-intent="document"]').classList.add('active');
+  document.getElementById('query-input').value = `Summarise "${title}" for me.`;
+  document.getElementById('query-input').focus();
+}
+
+// ── File upload ──────────────────────────────────────────────────────────────
+document.getElementById('file-input').addEventListener('change', async (e) => {
+  const files = Array.from(e.target.files);
+  const progress = document.getElementById('upload-progress');
+
+  for (const file of files) {
+    progress.style.display = 'block';
+    progress.textContent = `Uploading ${file.name}…`;
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('session_id', SESSION);
+    try {
+      const res = await fetch(`${API_BASE}/documents/ingest`, { method: 'POST', body: fd });
+      const data = await res.json();
+      showToast(data.message || `Ingested ${file.name}`);
+    } catch(e) {
+      showToast(`Upload failed: ${file.name}`);
+    }
+  }
+  progress.style.display = 'none';
+  e.target.value = '';
+  loadDocuments();
+  loadHealth();
+});
+
+// ── Health / metrics ─────────────────────────────────────────────────────────
+async function loadHealth() {
+  try {
+    const res = await fetch(`${API_BASE}/health`);
+    const data = await res.json();
+    document.getElementById('kb-count').textContent = data.kb_chunks;
+  } catch(e) {}
+}
+
+// ── Session clear ────────────────────────────────────────────────────────────
+async function clearSession() {
+  try {
+    await fetch(`${API_BASE}/chat/${SESSION}`, { method: 'DELETE' });
+    document.getElementById('messages').innerHTML = '';
+    showToast('Memory cleared.');
+  } catch(e) {}
+}
+
+// ── Toast ────────────────────────────────────────────────────────────────────
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 2800);
+}
+</script>
+</body>
+</html>

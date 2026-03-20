@@ -1,0 +1,56 @@
+# ─── LLM & Inference ───────────────────────────────────────────────────────
+ollama>=0.2.1
+vllm>=0.4.2
+openai>=1.30.0                  # vLLM exposes an OpenAI-compatible API
+
+# ─── LangChain ecosystem ───────────────────────────────────────────────────
+langchain>=0.2.6
+langchain-community>=0.2.6
+langchain-ollama>=0.1.1
+langchain-openai>=0.1.14        # used to talk to the vLLM OpenAI-compat server
+langchain-core>=0.2.10
+langgraph>=0.1.13               # stateful multi-agent orchestration
+
+# ─── Voice ─────────────────────────────────────────────────────────────────
+openai-whisper>=20231117
+sounddevice>=0.4.6
+soundfile>=0.12.1
+numpy>=1.26.0
+pyttsx3>=2.90                   # TTS (offline)
+
+# ─── Document processing ───────────────────────────────────────────────────
+docling>=1.14.0
+docling-core>=1.14.0
+python-docx>=1.1.0
+openpyxl>=3.1.2
+python-pptx>=0.6.23
+PyMuPDF>=1.24.4                 # fast PDF fallback / page images
+
+# ─── Vector store & embeddings ─────────────────────────────────────────────
+chromadb>=0.5.0
+sentence-transformers>=3.0.0
+faiss-cpu>=1.8.0
+
+# ─── Tools / Web ───────────────────────────────────────────────────────────
+requests>=2.31.0
+httpx>=0.27.0
+feedparser>=6.0.11              # RSS news aggregation
+duckduckgo-search>=6.1.7        # general search (no API key needed)
+wikipedia>=1.4.0
+beautifulsoup4>=4.12.3
+lxml>=5.2.2
+
+# ─── Data & config ─────────────────────────────────────────────────────────
+pydantic>=2.7.0
+pydantic-settings>=2.3.0
+python-dotenv>=1.0.1
+rich>=13.7.1                    # pretty terminal UI
+typer>=0.12.3                   # CLI
+PyYAML>=6.0.1
+
+# ─── Dev / test ────────────────────────────────────────────────────────────
+pytest>=8.2.0
+pytest-asyncio>=0.23.7
+black>=24.4.2
+ruff>=0.4.9
+mypy>=1.10.0

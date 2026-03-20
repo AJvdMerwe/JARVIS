@@ -79,8 +79,12 @@ class SearchAgent(BaseAgent):
         self._logger.info("SearchAgent handling: %s", query[:80])
 
         try:
+            logger.debug(f"search query: {query}")
             result = self._executor.invoke({"input": query})
+            logger.debug(f"result from LLM: {result}")
+
             output = result.get("output", "No information found.")
+            logger.debug(f"response from LLM: {output}")
             tool_calls = self._extract_tool_calls(
                 result.get("intermediate_steps", [])
             )

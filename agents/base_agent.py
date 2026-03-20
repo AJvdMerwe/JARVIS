@@ -19,6 +19,8 @@ from typing import Any, Optional
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import BaseTool
+from langchain.agents import create_agent
+from langchain_core.prompts import PromptTemplate
 
 from core.llm_manager import get_llm
 from core.memory import AssistantMemory
@@ -87,10 +89,10 @@ class BaseAgent(ABC):
     """
 
     def __init__(
-        self,
-        llm: Optional[BaseChatModel] = None,
-        memory: Optional[AssistantMemory] = None,
-        verbose: bool = settings.agent_verbose,
+            self,
+            llm: Optional[BaseChatModel] = None,
+            memory: Optional[AssistantMemory] = None,
+            verbose: bool = settings.agent_verbose,
     ) -> None:
         self._llm = llm or get_llm()
         self._memory = memory or AssistantMemory()
@@ -128,14 +130,68 @@ class BaseAgent(ABC):
 
     # ── Shared helpers ───────────────────────────────────────────────────────
 
+        # def _build_react_agent(self, system_prompt: Optional[str] = None):
+        #     """
+        #     Build a LangChain ReAct agent executor with this agent's tools.
+        #     Shared utility so subclasses don't repeat boilerplate.
+        #     """
+        #     from langchain.agents import AgentExecutor, create_react_agent
+        #     from langchain_core.prompts import PromptTemplate
+        #
+        #     tools = self.get_tools()
+        #
+        #     # Build tool descriptions string for the prompt
+        #     tool_descriptions = "\n".join(
+        #         f"- {t.name}: {t.description}" for t in tools
+        #     )
+        #     tool_names = ", ".join(t.name for t in tools)
+        #
+        #     base_prompt = system_prompt or (
+        #         f"You are a helpful assistant specialised in: {self.description}.\n"
+        #         "Answer the human's question as best you can using the available tools."
+        #     )
+        #
+        #     template = (
+        #         f"{base_prompt}\n\n"
+        #         "You have access to the following tools:\n"
+        #         "{tools}\n\n"
+        #         "Use the following format:\n"
+        #         "Question: the input question you must answer\n"
+        #         "Thought: you should always think about what to do\n"
+        #         "Action: the action to take, should be one of [{tool_names}]\n"
+        #         "Action Input: the input to the action\n"
+        #         "Observation: the result of the action\n"
+        #         "... (this Thought/Action/Action Input/Observation can repeat N times)\n"
+        #         "Thought: I now know the final answer\n"
+        #         "Final Answer: the final answer to the original input question\n\n"
+        #         "Begin!\n\n"
+        #         "Question: {input}\n"
+        #         "Thought: {agent_scratchpad}"
+        #     )
+        #
+        #     prompt = PromptTemplate.from_template(template).partial(
+        #         tools=tool_descriptions,
+        #         tool_names=tool_names,
+        #     )
+        #
+        #     agent = create_react_agent(self._llm, tools, prompt)
+        #     return AgentExecutor(
+        #         agent=agent,
+        #         tools=tools,
+        #         memory=self._memory.lc_memory,
+        #         max_iterations=settings.agent_max_iterations,
+        #         verbose=self._verbose,
+        #         handle_parsing_errors=True,
+        #         return_intermediate_steps=True,
+        #     )
+
+
     def _build_react_agent(self, system_prompt: Optional[str] = None):
         """
-        Build a LangChain ReAct agent executor with this agent's tools.
-        Shared utility so subclasses don't repeat boilerplate.
+        Build a modern LangChain agent.
+        In v1.2+, create_agent returns a compiled graph that handles
+        execution, so AgentExecutor is no longer required.
         """
-        from langchain.agents import AgentExecutor, create_react_agent
-        from langchain_core.prompts import PromptTemplate
-
         tools = self.get_tools()
 
         # Build tool descriptions string for the prompt
@@ -172,19 +228,26 @@ class BaseAgent(ABC):
             tool_names=tool_names,
         )
 
-        agent = create_react_agent(self._llm, tools, prompt)
-        return AgentExecutor(
-            agent=agent,
-            tools=tools,
-            memory=self._memory.lc_memory,
-            max_iterations=settings.agent_max_iterations,
-            verbose=self._verbose,
-            handle_parsing_errors=True,
-            return_intermediate_steps=True,
+        prompt = system_prompt or (
+            f"You are a helpful assistant specialised in: {self.description}."
         )
 
+        # create_agent returns an executable 'agent' object (a compiled graph)
+        agent = create_agent(
+            model=self._llm,
+            tools=tools,
+            system_prompt=prompt,
+            # 'checkpointer' replaces manual memory management
+            # 'max_steps' replaces max_iterations
+            # max_steps=getattr(settings, "agent_max_iterations", 10),
+            # handle_tool_errors=True,
+            # stream_runnables=True
+        )
+
+        return agent
+
     def _extract_tool_calls(
-        self, intermediate_steps: list
+            self, intermediate_steps: list
     ) -> list[tuple[str, str, str]]:
         """Parse LangChain intermediate_steps into our cleaner tuple format."""
         calls = []

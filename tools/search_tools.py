@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 import re
 from typing import Optional, Type
-
+import builtins
 from langchain_core.tools import BaseTool
 from pydantic import BaseModel, Field
 
@@ -181,9 +181,9 @@ class CalculatorTool(BaseTool):
 
     _ALLOWED_NAMES = {
         k: v
-        for k, v in vars(__builtins__).items()  # type: ignore[arg-type]
+        for k, v in vars(builtins).items()  # type: ignore[arg-type]
         if k in {"abs", "round", "min", "max", "sum", "pow"}
-    } if isinstance(vars(__builtins__), dict) else {}
+    } if isinstance(vars(builtins), dict) else {}
 
     def _run(self, expression: str) -> str:
         import math
@@ -207,7 +207,7 @@ class CalculatorTool(BaseTool):
             return "Expression blocked: contains forbidden keywords."
 
         try:
-            result = eval(expression, {"__builtins__": {}}, allowed)  # noqa: S307
+            result = eval(expression, {"builtins": {}}, allowed)  # noqa: S307
             return f"{expression} = {result}"
         except Exception as exc:
             return f"Could not evaluate '{expression}': {exc}"

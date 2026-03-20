@@ -35,7 +35,8 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from agents import AgentResponse, Orchestrator
+from agents.base_agent import AgentResponse
+from agents.orchestrator import Orchestrator
 from api.rate_limiter import RateLimitMiddleware
 from api.sse import router as sse_router
 from config import settings
@@ -279,8 +280,8 @@ async def clear_memory(session_id: str):
 
 @app.post("/documents/ingest", tags=["Documents"])
 async def ingest_document(
-    file: UploadFile = File(...),
-    session_id: str = Form(default="api"),
+        file: UploadFile = File(...),
+        session_id: str = Form(default="api"),
 ):
     """Upload and ingest a document (PDF, DOCX, XLSX, PPTX)."""
     from document_processing import SUPPORTED_SUFFIXES
@@ -338,9 +339,9 @@ async def delete_document(doc_title: str):
 
 @app.get("/documents/search", response_model=list[SearchResult], tags=["Documents"])
 async def search_documents(
-    q: str = Query(..., min_length=1, description="Search query"),
-    k: int = Query(default=5, ge=1, le=20),
-    doc_title: Optional[str] = Query(None),
+        q: str = Query(..., min_length=1, description="Search query"),
+        k: int = Query(default=5, ge=1, le=20),
+        doc_title: Optional[str] = Query(None),
 ):
     """Semantic search across the knowledge base."""
     from document_processing import DocumentManager

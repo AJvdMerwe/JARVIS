@@ -23,7 +23,6 @@ from pydantic import BaseModel, Field
 
 from agents.base_agent import AgentResponse, BaseAgent
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 #  Tool
 # ─────────────────────────────────────────────────────────────────────────────
@@ -119,8 +118,10 @@ class CalendarAgent(BaseAgent):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def register_agents() -> dict[str, type]:
-    return {"calendar_agent": CalendarAgent}
+    return {"calendar_agent": CalendarAgent,
+    }
 
 
 def register_tools() -> list[BaseTool]:
-    return [CalendarTool()]
+    return [CalendarTool(),
+            ]

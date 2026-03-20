@@ -21,6 +21,8 @@ from __future__ import annotations
 from typing import Optional
 
 import typer
+import logging
+
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.table import Table
@@ -36,6 +38,7 @@ app.add_typer(docs_app, name="docs")
 
 console = Console()
 
+logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  chat
@@ -67,10 +70,10 @@ def ask(
 ) -> None:
     """Send a single query and print the response."""
     from main import run_query
-
+    logger.info(f"Agent called: {agent}")
     with console.status("[yellow]Thinking…[/yellow]"):
         response_text = run_query(query, session_id=session, intent=agent)
-
+    logger.debug(f"agent response: {response_text}")
     console.print(Markdown(response_text))
 
 

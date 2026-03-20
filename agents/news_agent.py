@@ -85,6 +85,7 @@ class NewsAgent(BaseAgent):
 
         try:
             result = self._executor.invoke({"input": full_query})
+            logger.debug(f"results from search agent: {result}")
             output = result.get("output", "Could not retrieve news.")
             tool_calls = self._extract_tool_calls(
                 result.get("intermediate_steps", [])
@@ -115,7 +116,7 @@ class NewsAgent(BaseAgent):
         """Pull URLs out of tool outputs to use as references."""
         import re
 
-        url_pattern = re.compile(r"https?://[^\s\)\"\']+")
+        url_pattern = re.compile(r"https?://[^\s)\"\']+")
         urls: list[str] = []
         seen: set[str] = set()
         for _, _, output in tool_calls:

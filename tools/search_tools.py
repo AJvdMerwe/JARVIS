@@ -42,8 +42,10 @@ class DuckDuckGoSearchTool(BaseTool):
         try:
             from duckduckgo_search import DDGS  # type: ignore
 
+            logger.debug(f"now searching the web")
             with DDGS() as ddgs:
                 results = list(ddgs.text(query, max_results=max_results))
+                logger.debug(f"\nweb search results: {results}\n")
 
             if not results:
                 return f"No results found for: '{query}'"

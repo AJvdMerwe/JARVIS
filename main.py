@@ -24,7 +24,7 @@ from rich.prompt import Prompt
 from rich.rule import Rule
 from rich.theme import Theme
 
-from agents.orchestrator import Intent, Orchestrator
+from agents import Intent, Orchestrator
 from config import settings
 
 # ── Logging setup ────────────────────────────────────────────────────────────
@@ -52,9 +52,9 @@ console = Console(theme=_THEME)
 _BANNER = """
 ╔══════════════════════════════════════════════════════════════╗
 ║          Virtual Personal Assistant  v1.0                    ║
-║  Agents: Code · News · Search · Documents                    ║
+║  Agents: Chat · Code · News · Search · Documents             ║
 ║  Backend: {backend:<10}  Voice: {voice}                      ║
-║  Type  :quit  to exit  |  :help  for commands                ║
+║  Type  :quit  to exit  |  :help  for commands               ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 

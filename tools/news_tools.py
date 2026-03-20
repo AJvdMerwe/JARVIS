@@ -151,7 +151,8 @@ class TopicNewsTool(BaseTool):
 
     def _run(self, topic: str, max_results: int = 5) -> str:
         try:
-            from duckduckgo_search import DDGS  # type: ignore
+            # from duckduckgo_search import DDGS  # type: ignore
+            from ddgs import DDGS
 
             with DDGS() as ddgs:
                 results = list(ddgs.news(topic, max_results=max_results))

@@ -40,7 +40,8 @@ class DuckDuckGoSearchTool(BaseTool):
 
     def _run(self, query: str, max_results: int = 5) -> str:
         try:
-            from duckduckgo_search import DDGS  # type: ignore
+            # from duckduckgo_search import DDGS  # type: ignore
+            from ddgs import DDGS
 
             logger.debug(f"now searching the web")
             with DDGS() as ddgs:

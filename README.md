@@ -77,13 +77,13 @@ bash start.sh --help                                    # all options
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                           Interfaces                                    │
-│   CLI (Typer)  ·  Interactive REPL  ·  Voice loop  ·  Web UI           │
+│   CLI (Typer)  ·  Interactive REPL  ·  Voice loop  ·  Web UI            │
 │   FastAPI REST  ·  WebSocket stream  ·  SSE /stream                     │
 └────────────────────────────┬────────────────────────────────────────────┘
                              │
 ┌────────────────────────────▼────────────────────────────────────────────┐
 │                         Orchestrator                                    │
-│            Keyword router → LLM intent classifier                      │
+│            Keyword router → LLM intent classifier                       │
 │            Shared PersistentMemory · Tracing · Rate limiter             │
 └───────┬──────────┬──────────┬────────────────────┬───────────────────── ┘
         │          │          │                    │
@@ -106,15 +106,15 @@ bash start.sh --help                                    # all options
 
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                            Core Layer                                   │
-│  LLM Manager (Ollama ↔ vLLM)  ·  ResilientLLM (circuit breaker)       │
-│  Whisper STT  ·  pyttsx3 TTS  ·  ConversationMemory + Summariser       │
-│  EpisodicMemory  ·  ToolCache  ·  Tracer  ·  TaskScheduler             │
+│  LLM Manager (Ollama ↔ vLLM)  ·  ResilientLLM (circuit breaker)         │
+│  Whisper STT  ·  pyttsx3 TTS  ·  ConversationMemory + Summariser        │
+│  EpisodicMemory  ·  ToolCache  ·  Tracer  ·  TaskScheduler              │
 │  AsyncAgentRunner  ·  UserPreferences  ·  StructuredLogger              │
 └─────────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                          Plugin System                                  │
-│   plugins/*.py  →  register_agents()  +  register_tools()              │
+│   plugins/*.py  →  register_agents()  +  register_tools()               │
 │   Entry-points group: virtual_assistant.plugins                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```

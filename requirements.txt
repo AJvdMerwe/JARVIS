@@ -1,6 +1,11 @@
-# ─── LLM & Inference ───────────────────────────────────────────────────────
+# ─── Build toolchain ────────────────────────────────────────────────────────
+# vllm requires setuptools<81.0.0 on Python>3.11 — pin to a compatible range.
+setuptools>=77.0.3,<81.0.0
+wheel>=0.43.0
+
+# ─── LLM & Inference ────────────────────────────────────────────────────────
 ollama>=0.2.1
-vllm>=0.4.2
+vllm>=0.4.2,<0.18.0             # <0.18 keeps setuptools constraint satisfied
 openai>=1.30.0                  # vLLM exposes an OpenAI-compatible API
 
 # ─── LangChain ecosystem ───────────────────────────────────────────────────
@@ -39,7 +44,7 @@ duckduckgo-search>=6.1.7        # general search (no API key needed)
 wikipedia>=1.4.0
 beautifulsoup4>=4.12.3
 lxml>=5.2.2
-yfinance>=0.2.40
+yfinance>=0.2.40                   # Financial data (Yahoo Finance)
 
 # ─── Data & config ─────────────────────────────────────────────────────────
 pydantic>=2.7.0

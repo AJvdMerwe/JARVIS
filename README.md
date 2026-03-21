@@ -81,48 +81,48 @@ bash start.sh --backend vllm api                       # GPU + API server
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
 │                            Interfaces                                    │
-│   CLI (Typer)  ·  Interactive REPL  ·  Voice loop  ·  Web UI           │
-│   FastAPI REST ·  WebSocket /ws     ·  SSE /stream  ·  OpenAPI /docs   │
+│   CLI (Typer)  ·  Interactive REPL  ·  Voice loop  ·  Web UI             │
+│   FastAPI REST ·  WebSocket /ws     ·  SSE /stream  ·  OpenAPI /docs     │
 └───────────────────────────────┬──────────────────────────────────────────┘
                                 │
 ┌───────────────────────────────▼──────────────────────────────────────────┐
 │                           Orchestrator                                   │
 │                                                                          │
 │  Intent Router (2-stage)                                                 │
-│    Stage 1: keyword regex      < 1ms, no LLM call                       │
+│    Stage 1: keyword regex      < 1ms, no LLM call                        │
 │    Stage 2: LLM classification  only for ambiguous queries               │
 │                                                                          │
-│  ┌──────┬──────┬──────┬──────────┬───────────────┐                      │
-│  │ Chat │ Code │ News │  Search  │   Document    │                      │
-│  │Agent │Agent │Agent │  Agent   │    Agent      │                      │
-│  └──────┴──────┴──────┴──────────┴───────────────┘                      │
+│  ┌──────┬──────┬──────┬──────────┬───────────────┐                       │
+│  │ Chat │ Code │ News │  Search  │   Document    │                       │
+│  │Agent │Agent │Agent │  Agent   │    Agent      │                       │
+│  └──────┴──────┴──────┴──────────┴───────────────┘                       │
 │                                                                          │
-│  Post-processing pipeline (after every agent call)                      │
-│    PersistentMemory.save()  •  EpisodicMemory.extract_and_store()       │
-│    ConversationSummariser.maybe_summarise()  •  Tracer.record()         │
+│  Post-processing pipeline (after every agent call)                       │
+│    PersistentMemory.save()  •  EpisodicMemory.extract_and_store()        │
+│    ConversationSummariser.maybe_summarise()  •  Tracer.record()          │
 └──────────────────────────────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────────────────────────┐
 │                             Core Layer                                   │
 │                                                                          │
-│  llm_manager       Ollama / vLLM factory · @lru_cache singleton         │
-│  resilience        ResilientLLM · CircuitBreaker · retry + failover     │
+│  llm_manager       Ollama / vLLM factory · @lru_cache singleton          │
+│  resilience        ResilientLLM · CircuitBreaker · retry + failover      │
 │  memory            ConversationMemory · PersistentMemory (JSON)          │
-│  summariser        ConversationSummariser (rolling LLM compression)     │
-│  long_term_memory  EpisodicMemory (ChromaDB, cross-session recall)      │
-│  async_runner      AsyncAgentRunner · fan-out · streaming callbacks     │
-│  cache             ToolCache (TTL, LRU, disk) · @cached_tool            │
-│  tracing           Tracer · Span · TraceStore (JSONL sink)              │
-│  user_prefs        UserPreferences (Pydantic, per-user JSON)            │
-│  scheduler         TaskScheduler (daemon thread, 4 built-in tasks)      │
-│  logging           JsonFormatter · AssistantLogger · agent_call()       │
-│  voice             Whisper STT · MicrophoneListener VAD · pyttsx3 TTS   │
+│  summariser        ConversationSummariser (rolling LLM compression)      │
+│  long_term_memory  EpisodicMemory (ChromaDB, cross-session recall)       │
+│  async_runner      AsyncAgentRunner · fan-out · streaming callbacks      │
+│  cache             ToolCache (TTL, LRU, disk) · @cached_tool             │
+│  tracing           Tracer · Span · TraceStore (JSONL sink)               │
+│  user_prefs        UserPreferences (Pydantic, per-user JSON)             │ 
+│  scheduler         TaskScheduler (daemon thread, 4 built-in tasks)       │
+│  logging           JsonFormatter · AssistantLogger · agent_call()        │
+│  voice             Whisper STT · MicrophoneListener VAD · pyttsx3 TTS    │ 
 └──────────────────────────────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────────────────────────┐
 │                          Plugin System                                   │
-│   plugins/*.py  →  register_agents()  +  register_tools()              │
-│   Entry-point group: virtual_assistant.plugins                          │
+│   plugins/*.py  →  register_agents()  +  register_tools()                │
+│   Entry-point group: virtual_assistant.plugins                           │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 

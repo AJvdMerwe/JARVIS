@@ -149,9 +149,9 @@ only when Stage 1 is ambiguous:
 "Write a haiku about autumn"       →  CHAT     (creative "write a haiku")
 "Write a quicksort in Python"      →  CODE     (code noun after "write")
 "Debug this TypeError"             →  CODE     (debug keyword)
-"What are today's headlines?"     →  NEWS     (headlines keyword)
+"What are today's headlines?"      →  NEWS     (headlines keyword)
 "Summarise the uploaded PDF"       →  DOCUMENT (document keyword)
-"What is Apple's stock price?"    →  FINANCE  (stock price keyword)
+"What is Apple's stock price?"     →  FINANCE  (stock price keyword)
 "AAPL P/E ratio"                   →  FINANCE  (ratio keyword)
 "What is the capital of France?"   →  SEARCH   (no other signals)
 "Anything ambiguous…"              →  LLM classifies → defaults to CHAT

@@ -48,6 +48,22 @@ class DeleteDocInput(BaseModel):
     doc_title: str = Field(..., description="Exact title of the document to delete")
 
 
+class BulkIngestDirInput(BaseModel):
+    directory: str = Field(...,
+                           description="Path to a directory. All supported files are ingested recursively.")
+    recursive: bool = Field(default=True,
+                            description="Descend into sub-directories (default: True).")
+    dry_run: bool = Field(default=False,
+                          description="If True, detect file types and plan without writing to the store.")
+
+
+class BulkIngestFilesInput(BaseModel):
+    paths: str = Field(...,
+                       description="Comma-separated list of file paths to ingest.")
+    dry_run: bool = Field(default=False,
+                          description="If True, detect and plan without writing to the store.")
+
+
 # ── Tools ────────────────────────────────────────────────────────────────────
 
 class IngestDocumentTool(BaseTool):
@@ -187,4 +203,86 @@ def get_document_tools() -> list[BaseTool]:
         ListDocumentsTool(),
         GetFullDocumentTool(),
         DeleteDocumentTool(),
+        BulkIngestDirectoryTool(),
+        BulkIngestFilesTool(),
     ]
+
+
+# ── Bulk ingestion tools ──────────────────────────────────────────────────────
+
+class BulkIngestDirectoryTool(BaseTool):
+    """
+    Ingest an entire directory of documents into the knowledge base.
+
+    Applies type-appropriate extraction per file:
+      • PDF / DOCX / XLSX / PPTX  → Docling (OCR, tables, headings)
+      • TXT / MD / CSV / HTML     → text splitter
+      • JSON / XML                → structured flattener
+      • Unknown / empty           → skipped with a warning
+
+    Content-hash deduplication prevents re-ingesting unchanged files.
+    Returns a structured report with per-file outcomes and summary stats.
+    """
+
+    name: str        = "bulk_ingest_directory"
+    description: str = (
+        "Ingest all documents in a directory into the knowledge base. "
+        "Automatically detects file type (PDF, DOCX, XLSX, PPTX, TXT, MD, "
+        "CSV, HTML, JSON, XML) and applies the optimal extraction strategy. "
+        "Supports dry-run mode to preview without writing. "
+        "Use for: 'Index all files in ./reports/', 'Upload the documents folder'."
+    )
+    args_schema: Type[BaseModel] = BulkIngestDirInput
+
+    def _run(self, directory: str, recursive: bool = True,
+             dry_run: bool = False) -> str:
+        from document_processing.mass_uploader import MassUploader
+        try:
+            uploader = MassUploader()
+            report   = uploader.upload_directory(
+                directory, recursive=recursive, dry_run=dry_run
+            )
+            return report.summary()
+        except NotADirectoryError as exc:
+            return f"Error: {exc}"
+        except Exception as exc:
+            logger.error("BulkIngestDirectoryTool failed: %s", exc)
+            return f"Bulk ingest failed: {exc}"
+
+    async def _arun(self, **kwargs) -> str:
+        raise NotImplementedError
+
+
+class BulkIngestFilesTool(BaseTool):
+    """
+    Ingest a specific list of document files into the knowledge base.
+
+    Accepts a comma-separated list of paths.  Each file is type-detected
+    independently and processed with the optimal extraction strategy.
+    Identical files (same content hash) are skipped automatically.
+    """
+
+    name: str        = "bulk_ingest_files"
+    description: str = (
+        "Ingest a list of specific document files into the knowledge base. "
+        "Provide a comma-separated list of file paths. "
+        "Each file type is auto-detected (PDF, DOCX, TXT, CSV, JSON, etc.). "
+        "Use for: 'Ingest these files: report.pdf, data.xlsx, notes.md'."
+    )
+    args_schema: Type[BaseModel] = BulkIngestFilesInput
+
+    def _run(self, paths: str, dry_run: bool = False) -> str:
+        from document_processing.mass_uploader import MassUploader
+        path_list = [p.strip() for p in paths.split(",") if p.strip()]
+        if not path_list:
+            return "No file paths provided."
+        try:
+            uploader = MassUploader()
+            report   = uploader.upload_files(path_list, dry_run=dry_run)
+            return report.summary()
+        except Exception as exc:
+            logger.error("BulkIngestFilesTool failed: %s", exc)
+            return f"Bulk ingest failed: {exc}"
+
+    async def _arun(self, **kwargs) -> str:
+        raise NotImplementedError

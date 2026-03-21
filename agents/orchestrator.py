@@ -50,6 +50,7 @@ from .base_agent import AgentResponse, BaseAgent
 from .chat_agent import ChatAgent
 from .code_agent import CodeAgent
 from .document_agent import DocumentAgent
+from .financial_agent import FinancialAgent
 from .news_agent import NewsAgent
 from .search_agent import SearchAgent
 from core.memory import PersistentMemory
@@ -69,6 +70,7 @@ class Intent(str, Enum):
     NEWS     = "news"      # Fetch / summarise news
     SEARCH   = "search"    # Web search, Wikipedia, calculations
     DOCUMENT = "document"  # KB / document Q&A
+    FINANCE  = "finance"   # Stock quotes, financials, market analysis
     UNKNOWN  = "unknown"   # Unclassifiable — falls back to CHAT
 
 
@@ -157,6 +159,23 @@ _DOCUMENT_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 
+# Finance: stock market, financial analysis, company financials.
+_FINANCE_KEYWORDS = re.compile(
+    r"\b(stock|ticker|share(s)?|equity|nasdaq|nyse|s&p|"
+    r"[A-Z]{1,5}\s+(stock|price|share)|"
+    r"(stock|share) price|market cap|trading at|"
+    r"p/?e ratio|p/?b ratio|dividend|earnings per share|eps|"
+    r"income statement|balance sheet|cash flow|"
+    r"revenue|net income|ebitda|free cash flow|capex|"
+    r"return on equity|roe|roa|debt.to.equity|"
+    r"bull|bear market|portfolio|investment|investor|"
+    r"ipo|valuation|overvalued|undervalued|"
+    r"financial (results|statements|ratios|analysis)|"
+    r"quarterly (results|earnings|report)|annual report|"
+    r"yfinance|yahoo finance)\b",
+    re.IGNORECASE,
+)
+
 
 def _keyword_route(query: str) -> Optional[Intent]:
     """
@@ -164,15 +183,17 @@ def _keyword_route(query: str) -> Optional[Intent]:
 
     Returns an Intent or None (None triggers Stage-2 LLM routing).
     """
-    code_score = len(_CODE_KEYWORDS.findall(query))
-    news_score = len(_NEWS_KEYWORDS.findall(query))
-    doc_score  = len(_DOCUMENT_KEYWORDS.findall(query))
-    chat_score = len(_CHAT_KEYWORDS.findall(query))
+    code_score    = len(_CODE_KEYWORDS.findall(query))
+    news_score    = len(_NEWS_KEYWORDS.findall(query))
+    doc_score     = len(_DOCUMENT_KEYWORDS.findall(query))
+    chat_score    = len(_CHAT_KEYWORDS.findall(query))
+    finance_score = len(_FINANCE_KEYWORDS.findall(query))
 
     specialist_scores: dict[Intent, int] = {
         Intent.CODE:     code_score,
         Intent.NEWS:     news_score,
         Intent.DOCUMENT: doc_score,
+        Intent.FINANCE:  finance_score,
     }
     best_specialist, best_score = max(specialist_scores.items(), key=lambda x: x[1])
     second_best = sorted(specialist_scores.values(), reverse=True)[1]
@@ -278,6 +299,7 @@ class Orchestrator:
             Intent.NEWS:     NewsAgent(memory=self._memory),
             Intent.SEARCH:   SearchAgent(memory=self._memory),
             Intent.DOCUMENT: DocumentAgent(memory=self._memory),
+            Intent.FINANCE:  FinancialAgent(memory=self._memory),
         }
 
         # Optional: conversation history summariser.
@@ -625,6 +647,7 @@ class Orchestrator:
         graph.add_node("news",     _agent_node(Intent.NEWS))
         graph.add_node("search",   _agent_node(Intent.SEARCH))
         graph.add_node("document", _agent_node(Intent.DOCUMENT))
+        graph.add_node("finance",  _agent_node(Intent.FINANCE))
 
         # Entry + conditional edges.
         graph.set_entry_point("router")
@@ -638,9 +661,10 @@ class Orchestrator:
                 Intent.SEARCH.value:   "search",
                 Intent.DOCUMENT.value: "document",
                 Intent.UNKNOWN.value:  "chat",
+                Intent.FINANCE.value:  "finance",
             },
         )
-        for node_name in ("chat", "code", "news", "search", "document"):
+        for node_name in ("chat", "code", "news", "search", "document", "finance"):
             graph.add_edge(node_name, END)
 
         return graph.compile()

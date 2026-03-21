@@ -15,29 +15,42 @@ Architecture:
   │      │          └──► LLM classifier    (fallback for ambiguous queries) │
   │      │                                                                  │
   │      ▼                                                                  │
-  │  ┌──────┬──────┬──────┬──────────┬──────────┐                          │
-  │  │ Chat │ Code │ News │  Search  │ Document │                          │
-  │  └──┬───┴──┬───┴──┬───┴──────┬───┴──────┬───┘                          │
-  │     └──────┴──────┴──────────┴──────────┘                              │
-  │                         │                                               │
-  │                   AgentResponse                                         │
-  │                         │                                               │
-  │  ┌──────────────────────▼──────────────────────────────────────────┐   │
-  │  │                   Post-processing                               │   │
-  │  │  PersistentMemory save  •  EpisodicMemory extract               │   │
-  │  │  ConversationSummariser •  Tracer record                        │   │
-  │  └─────────────────────────────────────────────────────────────────┘   │
+  │  Primary Agent (chosen by intent)                                       │
+  │      │                                                                  │
+  │      ▼                                                                  │
+  │  Response Quality Check                                                 │
+  │      │                                                                  │
+  │      ├── SUFFICIENT ──► Post-process & return                          │
+  │      │                                                                  │
+  │      └── INSUFFICIENT ──► Fallback Chain                               │
+  │               │                                                         │
+  │               ├── Fallback Agent 1 → quality check → ...               │
+  │               ├── Fallback Agent 2 → quality check → ...               │
+  │               └── Final synthesis (LLM merges best evidence)           │
+  │                                                                         │
+  │  Post-processing (memory · episodic · summariser · tracing)            │
   └─────────────────────────────────────────────────────────────────────────┘
 
-Routing (two-stage):
-  Stage 1 — _keyword_route(): regex patterns, < 1 ms, no LLM call.
-  Stage 2 — _llm_route():     LLM classification, only for ambiguous queries.
+Fallback chains (per intent, highest priority first):
+  DOCUMENT  →  SEARCH  →  CHAT
+  SEARCH    →  DOCUMENT  →  CHAT
+  NEWS      →  SEARCH  →  CHAT
+  FINANCE   →  SEARCH  →  CHAT
+  CODE      →  SEARCH  →  CHAT
+  CHAT      →  SEARCH
+  (UNKNOWN  →  CHAT — no further fallback needed)
 
-  Intent priority: CODE > NEWS > DOCUMENT > CHAT > SEARCH > (LLM fallback)
+Quality gates (fast-path, no LLM cost):
+  • Error flag set on the response
+  • Output shorter than MIN_SUFFICIENT_LENGTH characters
+  • Output contains known failure phrases ("I don't know", "no information",
+    "cannot find", etc.)
+  • No tool calls when tool usage was expected
 
-Extensibility:
-  • Subclass BaseAgent (~50 lines) and add_agent(intent, agent).
-  • Or drop a plugin in plugins/*.py → register_agents().
+Optional LLM quality judge:
+  When enable_llm_quality_check=True the orchestrator asks the LLM after
+  every agent call: "Does this response adequately answer the question?"
+  This is more expensive but catches subtle non-answers.
 """
 from __future__ import annotations
 
@@ -106,12 +119,62 @@ class OrchestratorState(TypedDict, total=False):
 
 
 # =============================================================================
+#  Quality constants
+# =============================================================================
+
+# Minimum characters in an agent output for it to be considered "sufficient".
+# Shorter responses almost always indicate a failure or non-answer.
+MIN_SUFFICIENT_LENGTH: int = 40
+
+# Phrases that indicate the agent could not answer the question.
+# These are checked case-insensitively against the output.
+_FAILURE_PHRASES: tuple[str, ...] = (
+    "i don't know",
+    "i do not know",
+    "i'm not sure",
+    "i am not sure",
+    "no information",
+    "no relevant",
+    "cannot find",
+    "could not find",
+    "unable to find",
+    "not found in",
+    "not available",
+    "i cannot answer",
+    "i can't answer",
+    "no results found",
+    "nothing found",
+    "no data",
+    "insufficient information",
+    "i encountered an error",
+    "i encountered an issue",
+    "failed to retrieve",
+    "failed to fetch",
+    "failed to find",
+)
+
+
+# =============================================================================
+#  Fallback chains
+# =============================================================================
+
+# Per-intent ordered list of fallback intents to try when the primary agent
+# fails to answer.  The primary intent itself is NOT included here.
+_FALLBACK_CHAINS: dict[Intent, list[Intent]] = {
+    Intent.DOCUMENT: [Intent.SEARCH, Intent.CHAT],
+    Intent.SEARCH:   [Intent.DOCUMENT, Intent.CHAT],
+    Intent.NEWS:     [Intent.SEARCH, Intent.CHAT],
+    Intent.FINANCE:  [Intent.SEARCH, Intent.CHAT],
+    Intent.CODE:     [Intent.SEARCH, Intent.CHAT],
+    Intent.CHAT:     [Intent.SEARCH],
+    Intent.UNKNOWN:  [Intent.CHAT],
+}
+
+
+# =============================================================================
 #  Keyword-based fast router — Stage 1
 # =============================================================================
 
-# Chat: greetings, creative writing, conversational openers, explanations.
-# Creative "write X" patterns are explicit here so they score above CODE's
-# plain "write" match when the noun is non-code (poem, story, essay …).
 _CHAT_KEYWORDS = re.compile(
     r"\b(hi|hello|hey|how are you|what do you think|tell me about yourself|"
     r"who are you|let'?s talk|can you help|i need help|chat|convers|talk to me|"
@@ -126,9 +189,6 @@ _CHAT_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 
-# Code: programming-specific nouns.
-# "write" only matches when followed by a code noun (function, class, script…)
-# to avoid routing "write a poem" or "write a story" to CODE.
 _CODE_KEYWORDS = re.compile(
     r"\b(code|program|function|class|algorithm|debug|bug|error|"
     r"script|python|javascript|typescript|java|c\+\+|rust|sql|html|css|"
@@ -140,8 +200,6 @@ _CODE_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 
-# News: clearly news-specific terms.
-# "story", "article", "today", "report" deliberately omitted — too ambiguous.
 _NEWS_KEYWORDS = re.compile(
     r"\b(news|headlines?|breaking|current events|what'?s happening|briefing|"
     r"rss|feed|journalist|coverage|press|broadcast|"
@@ -150,7 +208,6 @@ _NEWS_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 
-# Document: knowledge-base and file-specific terms.
 _DOCUMENT_KEYWORDS = re.compile(
     r"\b(document|pdf|docx|excel|spreadsheet|ppt|powerpoint|file|"
     r"upload|ingest|knowledge base|my docs?|this report|the report|"
@@ -159,35 +216,55 @@ _DOCUMENT_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 
-# Finance: stock market, financial analysis, company financials.
 _FINANCE_KEYWORDS = re.compile(
-    r"\b(stock|ticker|share(s)?|equity|nasdaq|nyse|s&p|"
-    r"[A-Z]{1,5}\s+(stock|price|share)|"
+    r"\b(stock|ticker|share(s)?|equity|nasdaq|nyse|s&p 500|"
     r"(stock|share) price|market cap|trading at|"
-    r"p/?e ratio|p/?b ratio|dividend|earnings per share|eps|"
+    r"p/?e( ratio)?|p/?b( ratio)?|dividend|earnings per share|eps|"
     r"income statement|balance sheet|cash flow|"
     r"revenue|net income|ebitda|free cash flow|capex|"
     r"return on equity|roe|roa|debt.to.equity|"
-    r"bull|bear market|portfolio|investment|investor|"
+    r"bull|bear market|portfolio|"
     r"ipo|valuation|overvalued|undervalued|"
-    r"financial (results|statements|ratios|analysis)|"
+    r"financial (results|statements|ratios|analysis|performance)|"
     r"quarterly (results|earnings|report)|annual report|"
-    r"yfinance|yahoo finance)\b",
+    r"stock (performance|history|return|gain)|"
+    r"compare .{0,30} (stock|share|ticker)|"
+    r"yfinance|yahoo finance|"
+    r"(price|market) (history|performance|trend)|"
+    r"volatility|drawdown|cagr|annuali[sz]ed return|"
+    r"52.week|year.to.date stock|"
+    r"(earnings|revenue|profit) (growth|margin)|"
+    r"analyst (rating|target|recommendation)|"
+    r"how has .{1,20} (stock|share|performed|done)|"
+    r"(stock|share|investment) (analysis|report|thesis)|"
+    r"invest(ment|ing|or) in .{1,20} (stock|share)|"
+    r"(performed|performance) (over|in|last|past) .{1,20} year|"
+    r"compare .{1,30} (stock|valuation|ratio|p.e|market cap)|"
+    r"analy[sz]e .{1,30} (stock|share|invest|valuation)|"
+    r"(invest(ment|ing) in|buy|sell) .{1,20} (stock|share|ticker)|"
+    r"[A-Z]{2,5} (vs\.?|versus) [A-Z]{2,5} .{0,20}(valuation|ratio|stock|p.e|comparison))\b",
+    re.IGNORECASE,
+)
+
+_FINANCE_PHRASES = re.compile(
+    r"analy[sz]e .{1,30} (stock|for invest|valuat)|"
+    r"invest(ment|ing|or)? in .{1,25} (stock|share)|"
+    r"(how has|how did) .{1,20} (stock|share|perform)|"
+    r"[A-Z]{2,5} vs\.? [A-Z]{2,5} .{0,25}(valuat|ratio|p/?e|margin|compar)|"
+    r"(buy|sell|hold|short) .{1,20} stock|"
+    r"[A-Z]{2,5} (stock|share) (price|performance|analysis|valuation)",
     re.IGNORECASE,
 )
 
 
 def _keyword_route(query: str) -> Optional[Intent]:
-    """
-    Stage-1 intent detector using pre-compiled regex patterns.
-
-    Returns an Intent or None (None triggers Stage-2 LLM routing).
-    """
+    """Stage-1 intent detector. Returns None when ambiguous."""
     code_score    = len(_CODE_KEYWORDS.findall(query))
     news_score    = len(_NEWS_KEYWORDS.findall(query))
     doc_score     = len(_DOCUMENT_KEYWORDS.findall(query))
     chat_score    = len(_CHAT_KEYWORDS.findall(query))
     finance_score = len(_FINANCE_KEYWORDS.findall(query))
+    finance_score += len(_FINANCE_PHRASES.findall(query))
 
     specialist_scores: dict[Intent, int] = {
         Intent.CODE:     code_score,
@@ -198,34 +275,19 @@ def _keyword_route(query: str) -> Optional[Intent]:
     best_specialist, best_score = max(specialist_scores.items(), key=lambda x: x[1])
     second_best = sorted(specialist_scores.values(), reverse=True)[1]
 
-    # Specialist wins only if it has a clear lead AND beats CHAT signals.
     if best_score >= 1 and best_score > second_best and chat_score < best_score:
         return best_specialist
-
-    # CHAT wins when it has signals matching or exceeding all specialists.
     if chat_score >= 1 and (best_score == 0 or chat_score >= best_score):
         return Intent.CHAT
-
-    # Specialist still wins with a strong numerical lead over CHAT.
     if best_score >= 2 and best_score > chat_score:
         return best_specialist
-
-    # SEARCH for purely factual queries with no other signals.
     if best_score == 0 and chat_score == 0:
         return Intent.SEARCH
+    return None
 
-    return None   # ambiguous — delegate to LLM
-
-
-# =============================================================================
-#  LLM-based router — Stage 2
-# =============================================================================
 
 def _llm_route(query: str) -> Intent:
-    """
-    Stage-2 classifier: calls the LLM for ambiguous queries.
-    Falls back to Intent.CHAT on any failure.
-    """
+    """Stage-2 classifier. Falls back to Intent.CHAT on failure."""
     llm = get_llm()
     prompt = (
         "Classify the following user query into exactly one category.\n\n"
@@ -248,14 +310,218 @@ def _llm_route(query: str) -> Intent:
 
 
 # =============================================================================
+#  Response quality evaluation
+# =============================================================================
+
+def _is_sufficient_response(response: AgentResponse, query: str) -> bool:
+    """
+    Fast-path quality gate — no LLM call required.
+
+    Returns True when the response is likely a genuine answer to the query.
+    Returns False when any of these failure signals are detected:
+
+    1. ``response.error`` is set.
+    2. Output is shorter than MIN_SUFFICIENT_LENGTH characters.
+    3. Output contains a known failure phrase (case-insensitive).
+
+    Parameters
+    ----------
+    response : AgentResponse
+        The candidate response to evaluate.
+    query : str
+        The original user query (reserved for future heuristics).
+
+    Returns
+    -------
+    bool
+    """
+    # 1. Explicit error
+    if response.error:
+        logger.debug(
+            "Quality: FAIL — agent '%s' returned error: %s",
+            response.agent_name, response.error,
+        )
+        return False
+
+    text = (response.output or "").strip()
+
+    # 2. Too short to be a real answer
+    if len(text) < MIN_SUFFICIENT_LENGTH:
+        logger.debug(
+            "Quality: FAIL — output too short (%d chars < %d) from '%s'.",
+            len(text), MIN_SUFFICIENT_LENGTH, response.agent_name,
+        )
+        return False
+
+    # 3. Known failure phrases
+    text_lower = text.lower()
+    for phrase in _FAILURE_PHRASES:
+        if phrase in text_lower:
+            logger.debug(
+                "Quality: FAIL — failure phrase %r detected in '%s' output.",
+                phrase, response.agent_name,
+            )
+            return False
+
+    logger.debug(
+        "Quality: PASS — '%s' response (%d chars).",
+        response.agent_name, len(text),
+    )
+    return True
+
+
+def _llm_quality_check(query: str, response: AgentResponse) -> bool:
+    """
+    Optional LLM-powered quality judge.
+
+    Asks the configured LLM whether the response adequately answers the
+    question.  More accurate than the fast-path gate but incurs a latency
+    and token cost penalty.
+
+    Parameters
+    ----------
+    query : str
+        The original user question.
+    response : AgentResponse
+        The candidate response to evaluate.
+
+    Returns
+    -------
+    bool
+        True when the LLM judges the response as sufficient.
+        Defaults to True on any error (fail-open to avoid unnecessary retries).
+    """
+    try:
+        llm    = get_llm()
+        prompt = (
+            "You are a response quality evaluator.\n\n"
+            f"User question: {query}\n\n"
+            f"Agent response:\n{response.output[:1500]}\n\n"
+            "Does this response adequately and directly answer the user's question?\n"
+            "Consider it SUFFICIENT if it provides relevant, useful information.\n"
+            "Consider it INSUFFICIENT only if it:\n"
+            "  - Explicitly says it doesn't know or cannot answer\n"
+            "  - Contains only an error message\n"
+            "  - Is completely off-topic\n"
+            "  - Provides no information relevant to the question\n\n"
+            "Reply with exactly one word: SUFFICIENT or INSUFFICIENT"
+        )
+        result = llm.invoke(prompt)
+        verdict = str(result.content).strip().upper()
+        is_ok   = verdict == "SUFFICIENT"
+        logger.debug(
+            "LLM quality judge: %s for agent '%s'.",
+            verdict, response.agent_name,
+        )
+        return is_ok
+    except Exception as exc:
+        logger.debug("LLM quality check failed (%s); defaulting to PASS.", exc)
+        return True   # fail-open: don't retry on checker failure
+
+
+def _synthesise_from_attempts(
+        query:    str,
+        attempts: list[tuple[str, AgentResponse]],
+) -> AgentResponse:
+    """
+    Ask the LLM to synthesise the best possible answer from all partial
+    attempts when every agent in the fallback chain failed to answer
+    sufficiently on its own.
+
+    The synthesiser is given all non-empty outputs as evidence and
+    instructed to combine them into a coherent final response.
+
+    Parameters
+    ----------
+    query : str
+        The original user question.
+    attempts : list[tuple[str, AgentResponse]]
+        Each element is (agent_name, response) in the order they were tried.
+
+    Returns
+    -------
+    AgentResponse
+        Synthesised response.  Falls back to the best individual attempt
+        (longest non-error output) if the LLM itself fails.
+    """
+    # Filter to responses that have at least some content
+    useful = [
+        (name, resp) for name, resp in attempts
+        if resp.output and not resp.error and len(resp.output.strip()) > 10
+    ]
+
+    if not useful:
+        # All agents errored — return the last attempt as-is
+        last_name, last_resp = attempts[-1]
+        return last_resp
+
+    evidence_blocks = "\n\n---\n\n".join(
+        f"[{name}]:\n{resp.output[:800]}"
+        for name, resp in useful
+    )
+
+    try:
+        llm    = get_llm()
+        prompt = (
+            f"The user asked: {query}\n\n"
+            "The following agents were consulted but none gave a complete answer "
+            "on their own. Synthesise the best possible response using all the "
+            "information below:\n\n"
+            f"{evidence_blocks}\n\n"
+            "Instructions:\n"
+            "- Directly answer the user's question.\n"
+            "- Combine relevant information from the sources above.\n"
+            "- If the information is insufficient, say so clearly.\n"
+            "- Do not mention the internal agents or this synthesis process.\n\n"
+            "Answer:"
+        )
+        result = llm.invoke(prompt)
+        output = str(result.content).strip()
+        # Collect all tool_calls and references from every attempt
+        all_tool_calls = [tc for _, r in attempts for tc in r.tool_calls]
+        all_references = list({ref for _, r in attempts for ref in r.references})
+        logger.info(
+            "Synthesised answer from %d attempt(s) for query: %s…",
+            len(useful), query[:60],
+        )
+        return AgentResponse(
+            output=output,
+            agent_name="synthesised",
+            tool_calls=all_tool_calls,
+            references=all_references,
+        )
+    except Exception as exc:
+        logger.error("Synthesis failed: %s; returning best single attempt.", exc)
+        # Return the longest useful response as the best fallback
+        best_name, best_resp = max(useful, key=lambda x: len(x[1].output))
+        return best_resp
+
+
+# =============================================================================
 #  Orchestrator
 # =============================================================================
 
 class Orchestrator:
     """
-    Routes user queries to the most appropriate specialist agent and
-    coordinates all post-processing (memory, tracing, episodic facts,
-    context compression, plugins).
+    Routes user queries to the most appropriate specialist agent, evaluates
+    response quality, and iterates through a per-intent fallback chain until
+    a sufficient answer is found.
+
+    Fallback behaviour
+    ------------------
+    After each agent call, the response is checked against quality gates:
+
+    Fast gates (no LLM cost):
+      • ``response.error`` is set
+      • Output shorter than MIN_SUFFICIENT_LENGTH chars
+      • Output contains a known failure phrase ("I don't know", etc.)
+
+    Optional LLM gate (``enable_llm_quality_check=True``):
+      • Asks the LLM to judge whether the response answers the question
+
+    If the response fails, the next agent in the intent's fallback chain is
+    tried.  After all agents in the chain are exhausted, the LLM synthesises
+    the best possible answer from all collected evidence.
 
     Parameters
     ----------
@@ -263,36 +529,42 @@ class Orchestrator:
         Identifier for persistent memory, tracing, and episodic recall.
     enable_episodic : bool
         Store and recall facts from past sessions (EpisodicMemory).
-        Off by default — requires ChromaDB + embedding model.
     enable_summariser : bool
-        Compress old conversation turns automatically (ConversationSummariser).
-        Off by default — suitable for long-running sessions.
+        Compress old conversation turns automatically.
     enable_plugins : bool
-        Auto-discover and load agents/tools from plugins/ at startup.
+        Auto-discover agents/tools from plugins/ at startup.
     enable_scheduler : bool
-        Start the background TaskScheduler (cache purge, trace rotation…).
+        Start the background TaskScheduler.
+    enable_llm_quality_check : bool
+        Use the LLM to judge response quality (more accurate, slower).
+        Default False — fast pattern-matching gates are used instead.
+    max_fallback_attempts : int
+        Maximum number of fallback agents to try after the primary fails.
+        Default 2.  Set to 0 to disable fallback entirely.
     summarise_after : int
         Total message count that triggers history compression.
     recent_k : int
-        Number of most-recent turns to keep verbatim after compression.
+        Verbatim turns to keep after compression.
     """
 
     def __init__(
-        self,
-        session_id:        str  = "default",
-        enable_episodic:   bool = False,
-        enable_summariser: bool = False,
-        enable_plugins:    bool = True,
-        enable_scheduler:  bool = False,
-        summarise_after:   int  = 40,
-        recent_k:          int  = 10,
+            self,
+            session_id:                str  = "default",
+            enable_episodic:           bool = False,
+            enable_summariser:         bool = False,
+            enable_plugins:            bool = True,
+            enable_scheduler:          bool = False,
+            enable_llm_quality_check:  bool = False,
+            max_fallback_attempts:     int  = 2,
+            summarise_after:           int  = 40,
+            recent_k:                  int  = 10,
     ) -> None:
-        self._session_id = session_id
+        self._session_id               = session_id
+        self._enable_llm_quality_check = enable_llm_quality_check
+        self._max_fallback_attempts    = max_fallback_attempts
 
-        # Persistent conversation memory (shared by all agents).
         self._memory = PersistentMemory(session_id=session_id)
 
-        # Specialist agents — all share the same memory instance.
         self._agents: dict[Intent, BaseAgent] = {
             Intent.CHAT:     ChatAgent(memory=self._memory),
             Intent.CODE:     CodeAgent(memory=self._memory),
@@ -302,7 +574,6 @@ class Orchestrator:
             Intent.FINANCE:  FinancialAgent(memory=self._memory),
         }
 
-        # Optional: conversation history summariser.
         self._summariser = None
         if enable_summariser:
             try:
@@ -311,113 +582,109 @@ class Orchestrator:
                     summarise_after=summarise_after,
                     recent_k=recent_k,
                 )
-                logger.info(
-                    "ConversationSummariser enabled (after=%d, k=%d).",
-                    summarise_after, recent_k,
-                )
             except Exception as exc:
                 logger.warning("ConversationSummariser init failed: %s", exc)
 
-        # Optional: long-term episodic memory.
         self._episodic = None
         if enable_episodic:
             try:
                 from core.long_term_memory import EpisodicMemory
                 self._episodic = EpisodicMemory()
-                logger.info("EpisodicMemory enabled.")
             except Exception as exc:
                 logger.warning("EpisodicMemory init failed: %s", exc)
 
-        # Optional: plugin discovery.
         if enable_plugins:
             self._load_plugins()
 
-        # Optional: background scheduler.
         if enable_scheduler:
             self.start_scheduler()
 
         logger.info(
             "Orchestrator ready | session='%s' | agents=%d | "
-            "episodic=%s | summariser=%s",
-            session_id,
-            len(self._agents),
-            bool(self._episodic),
-            bool(self._summariser),
+            "fallback=%s (max=%d) | llm_quality=%s",
+            session_id, len(self._agents),
+            "on", self._max_fallback_attempts,
+            self._enable_llm_quality_check,
         )
 
     # -------------------------------------------------------------------------
-    #  Core run
+    #  Core run  (with fallback loop)
     # -------------------------------------------------------------------------
 
     def run(self, query: str, **kwargs: Any) -> AgentResponse:
         """
-        Route a query to the best agent and return its response.
+        Route a query to the best agent, evaluate quality, and iterate
+        through fallback agents until a sufficient answer is produced.
 
-        Cross-cutting concerns handled automatically:
-          * Intent routing (keyword → LLM fallback)
-          * Episodic context injection when available
-          * Agent execution
-          * Persistent memory save
-          * Episodic fact extraction
-          * History compression trigger
-          * Request tracing
+        Execution flow
+        --------------
+        1.  Detect intent (keyword → LLM fallback).
+        2.  Call the primary agent.
+        3.  Evaluate response quality (fast gates + optional LLM judge).
+        4.  If INSUFFICIENT and fallback is enabled:
+              a. Try each agent in the intent's fallback chain.
+              b. Re-evaluate quality after each attempt.
+              c. Return the first SUFFICIENT response.
+        5.  If all attempts fail: synthesise from all evidence via LLM.
+        6.  Post-process: persist memory, extract episodic facts,
+            maybe summarise, record trace.
 
         Parameters
         ----------
         query : str
-            The user input text.
+            The user's input.
         intent : str | Intent, optional
-            Force a specific intent, bypassing routing entirely.
+            Force a specific intent, bypassing routing.
         user_id : str, optional
-            Load UserPreferences for this user and pass to the agent.
-        doc_title : str, optional
-            Restrict DocumentAgent search to a specific document.
+            UserPreferences for this user.
         **kwargs
-            All other kwargs are forwarded to the selected agent's run().
+            Forwarded to each agent's run().
 
         Returns
         -------
         AgentResponse
-            Contains .output, .tool_calls, .references, .error.
         """
         forced  = kwargs.pop("intent",  None)
         user_id = kwargs.get("user_id", None)
 
-        # Stage 1 / 2 routing.
-        if forced:
-            intent = Intent(forced) if isinstance(forced, str) else forced
-        else:
-            intent = self._route(query)
+        intent = (
+            Intent(forced) if isinstance(forced, str)
+            else forced
+            if forced
+            else self._route(query)
+        )
 
-        logger.info("session='%s' intent=%s query='%s…'",
-                    self._session_id, intent.value, query[:60])
+        logger.info(
+            "session='%s' intent=%s query='%s…'",
+            self._session_id, intent.value, query[:60],
+        )
 
-        # Open a trace span (best-effort — never blocks the call).
         trace_obj = self._open_trace(query)
 
-        # Inject episodic context as a prompt prefix (if available).
         if getattr(self, "_episodic", None):
             self._inject_episodic_context(query, kwargs)
-
-        # Apply user preferences (if user_id provided).
         if user_id:
             kwargs.setdefault("user_id", user_id)
 
-        # Execute the agent.
-        agent    = self._agents.get(intent) or self._agents[Intent.CHAT]
-        response = agent.run(query, **kwargs)
+        # ── Primary attempt ───────────────────────────────────────────────────
+        primary_agent = self._agents.get(intent) or self._agents[Intent.CHAT]
+        response      = self._call_agent(primary_agent, query, **kwargs)
+        attempts: list[tuple[str, AgentResponse]] = [(primary_agent.name, response)]
 
-        # Close the trace span.
+        # ── Fallback loop ─────────────────────────────────────────────────────
+        if self._max_fallback_attempts > 0 and not self._is_sufficient(query, response):
+            response = self._run_fallback_chain(
+                query, intent, attempts, max_attempts=self._max_fallback_attempts,
+                **kwargs,
+            )
+
+        # ── Post-processing ───────────────────────────────────────────────────
         self._close_trace(trace_obj, response)
-
-        # Persist conversation turn.
         self._memory.save_context(query, response.output)
 
-        # Extract episodic facts from this exchange (non-blocking, swallows errors).
         if getattr(self, "_episodic", None) and response.output and not response.error:
             self._store_episodic_facts(query, response.output)
 
-        # Maybe compress conversation history.
         if getattr(self, "_summariser", None):
             try:
                 self._summariser.maybe_summarise(self._memory)
@@ -427,14 +694,145 @@ class Orchestrator:
         return response
 
     # -------------------------------------------------------------------------
+    #  Fallback chain implementation
+    # -------------------------------------------------------------------------
+
+    def _run_fallback_chain(
+            self,
+            query:        str,
+            primary:      Intent,
+            attempts:     list[tuple[str, AgentResponse]],
+            max_attempts: int,
+            **kwargs: Any,
+    ) -> AgentResponse:
+        """
+        Iterate through the fallback chain for the given primary intent until
+        a sufficient response is found or the chain is exhausted.
+
+        Parameters
+        ----------
+        query : str
+            The original user query.
+        primary : Intent
+            The primary intent that failed.
+        attempts : list
+            Already-collected (agent_name, response) pairs — mutated in place.
+        max_attempts : int
+            Maximum additional agents to try.
+
+        Returns
+        -------
+        AgentResponse
+            The first sufficient response found, or a synthesis of all
+            attempts if none is sufficient.
+        """
+        fallback_intents = _FALLBACK_CHAINS.get(primary, [Intent.CHAT])
+        tried_intents    = {primary}
+        fallbacks_run    = 0
+
+        for fb_intent in fallback_intents:
+            if fallbacks_run >= max_attempts:
+                logger.info(
+                    "Fallback limit (%d) reached for query: %s…",
+                    max_attempts, query[:60],
+                )
+                break
+
+            if fb_intent in tried_intents:
+                continue
+            tried_intents.add(fb_intent)
+
+            fb_agent = self._agents.get(fb_intent)
+            if not fb_agent:
+                continue
+
+            logger.info(
+                "Fallback %d/%d: trying '%s' after '%s' failed for query: %s…",
+                fallbacks_run + 1, max_attempts,
+                fb_intent.value, primary.value, query[:60],
+                )
+
+            fb_response = self._call_agent(fb_agent, query, **kwargs)
+            attempts.append((fb_agent.name, fb_response))
+            fallbacks_run += 1
+
+            if self._is_sufficient(query, fb_response):
+                logger.info(
+                    "Fallback '%s' produced a sufficient response.",
+                    fb_intent.value,
+                )
+                return fb_response
+
+            logger.debug(
+                "Fallback '%s' response also insufficient; continuing chain.",
+                fb_intent.value,
+            )
+
+        # All agents in the chain failed — synthesise from collected evidence
+        logger.info(
+            "All %d agent(s) in fallback chain insufficient; synthesising answer.",
+            len(attempts),
+        )
+        return _synthesise_from_attempts(query, attempts)
+
+    # -------------------------------------------------------------------------
+    #  Quality evaluation
+    # -------------------------------------------------------------------------
+
+    def _is_sufficient(self, query: str, response: AgentResponse) -> bool:
+        """
+        Determine whether a response adequately answers the query.
+
+        Applies the fast-path pattern gates first.  If those pass and
+        ``enable_llm_quality_check`` is True, also asks the LLM.
+
+        Parameters
+        ----------
+        query : str
+        response : AgentResponse
+
+        Returns
+        -------
+        bool
+        """
+        if not _is_sufficient_response(response, query):
+            return False
+        if self._enable_llm_quality_check:
+            return _llm_quality_check(query, response)
+        return True
+
+    # -------------------------------------------------------------------------
+    #  Agent call wrapper
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _call_agent(
+            agent: BaseAgent,
+            query: str,
+            **kwargs: Any,
+    ) -> AgentResponse:
+        """
+        Call an agent and catch all exceptions, converting them into a
+        failed AgentResponse so the fallback loop can continue.
+        """
+        try:
+            return agent.run(query, **kwargs)
+        except Exception as exc:
+            logger.error(
+                "Agent '%s' raised an exception: %s", agent.name, exc
+            )
+            return AgentResponse(
+                output=f"Agent error: {exc}",
+                agent_name=agent.name,
+                error=str(exc),
+            )
+
+    # -------------------------------------------------------------------------
     #  Routing helpers
     # -------------------------------------------------------------------------
 
     def route_only(self, query: str) -> Intent:
-        """
-        Classify a query without running an agent.
-        Useful for UI previews (e.g. "code agent will handle this").
-        """
+        """Classify a query without running any agent."""
         return self._route(query)
 
     # -------------------------------------------------------------------------
@@ -442,25 +840,11 @@ class Orchestrator:
     # -------------------------------------------------------------------------
 
     def ingest_document(self, file_path: str) -> str:
-        """
-        Ingest a document directly into the knowledge base.
-
-        Parameters
-        ----------
-        file_path : str
-            Path to PDF, DOCX, XLSX, or PPTX.
-
-        Returns
-        -------
-        str
-            Human-readable status message.
-        """
-        doc_agent: DocumentAgent = self._agents[Intent.DOCUMENT]  # type: ignore[assignment]
+        doc_agent: DocumentAgent = self._agents[Intent.DOCUMENT]  # type: ignore
         return doc_agent.ingest(file_path)
 
     def list_documents(self) -> list[dict]:
-        """Return all documents currently in the knowledge base."""
-        doc_agent: DocumentAgent = self._agents[Intent.DOCUMENT]  # type: ignore[assignment]
+        doc_agent: DocumentAgent = self._agents[Intent.DOCUMENT]  # type: ignore
         return doc_agent.list_documents()
 
     # -------------------------------------------------------------------------
@@ -468,7 +852,6 @@ class Orchestrator:
     # -------------------------------------------------------------------------
 
     def clear_memory(self) -> None:
-        """Clear all conversation history for this session."""
         self._memory.clear()
         logger.info("Cleared memory for session '%s'.", self._session_id)
 
@@ -477,22 +860,9 @@ class Orchestrator:
     # -------------------------------------------------------------------------
 
     def get_agent(self, intent: Intent) -> BaseAgent:
-        """
-        Retrieve an agent by intent.
-
-        Raises
-        ------
-        KeyError
-            If no agent is registered for the given intent.
-        """
         return self._agents[intent]
 
     def add_agent(self, intent: Intent, agent: BaseAgent) -> None:
-        """
-        Register or replace an agent at runtime.
-
-        Used by the plugin system and for testing / extension.
-        """
         self._agents[intent] = agent
         logger.info("Agent '%s' registered for intent '%s'.",
                     agent.name, intent.value)
@@ -502,18 +872,15 @@ class Orchestrator:
     # -------------------------------------------------------------------------
 
     def start_scheduler(self) -> None:
-        """Start the background TaskScheduler if it is not already running."""
         try:
             from core.scheduler import get_scheduler
             sched = get_scheduler()
             if not sched.is_running:
                 sched.start()
-                logger.info("Background scheduler started.")
         except Exception as exc:
             logger.warning("Scheduler start failed: %s", exc)
 
     def stop_scheduler(self) -> None:
-        """Gracefully stop the background scheduler."""
         try:
             from core.scheduler import get_scheduler
             get_scheduler().stop()
@@ -526,17 +893,14 @@ class Orchestrator:
 
     @property
     def session_id(self) -> str:
-        """Session identifier passed at construction."""
         return self._session_id
 
     @property
     def memory(self) -> PersistentMemory:
-        """Shared persistent memory for this session."""
         return self._memory
 
     @property
     def intents(self) -> list[Intent]:
-        """All intents that currently have a registered agent."""
         return list(self._agents.keys())
 
     # -------------------------------------------------------------------------
@@ -544,42 +908,19 @@ class Orchestrator:
     # -------------------------------------------------------------------------
 
     async def run_async(self, query: str, **kwargs: Any) -> AgentResponse:
-        """
-        Non-blocking async variant of run().
-
-        Wraps the synchronous agent call in asyncio.to_thread() so it
-        does not block the FastAPI event loop.
-        """
         import asyncio
         return await asyncio.to_thread(self.run, query, **kwargs)
 
     async def fanout(
-        self,
-        query:   str,
-        intents: list[Intent],
-        **kwargs: Any,
+            self,
+            query:   str,
+            intents: list[Intent],
+            **kwargs: Any,
     ) -> list[AgentResponse]:
-        """
-        Run multiple agents in parallel for the same query.
-
-        Parameters
-        ----------
-        query : str
-            Query sent to all agents simultaneously.
-        intents : list[Intent]
-            Which agents to invoke.
-        **kwargs
-            Forwarded to each agent's run().
-
-        Returns
-        -------
-        list[AgentResponse]
-            One response per intent, in the same order.
-        """
         from core.async_runner import AsyncAgentRunner
-        runner  = AsyncAgentRunner()
-        agents  = [self._agents[i] for i in intents if i in self._agents]
-        result  = await runner.fanout(query, agents, **kwargs)
+        runner = AsyncAgentRunner()
+        agents = [self._agents[i] for i in intents if i in self._agents]
+        result = await runner.fanout(query, agents, **kwargs)
         return result.responses
 
     # -------------------------------------------------------------------------
@@ -587,25 +928,7 @@ class Orchestrator:
     # -------------------------------------------------------------------------
 
     def build_graph(self):
-        """
-        Build and return a compiled LangGraph StateGraph.
-
-        Node layout:
-          router → conditional → [chat | code | news | search | document] → END
-
-        The ``dispatch`` function reads ``state["intent"]`` after the
-        router node writes it, routing execution to the correct agent node.
-
-        Returns
-        -------
-        CompiledGraph
-            Ready for .invoke({"query": "…"}) or async .astream().
-
-        Raises
-        ------
-        ImportError
-            If langgraph is not installed.
-        """
+        """Build and return a compiled LangGraph StateGraph."""
         try:
             from langgraph.graph import StateGraph, END  # type: ignore
         except ImportError as exc:
@@ -615,32 +938,28 @@ class Orchestrator:
 
         graph = StateGraph(OrchestratorState)
 
-        # Router node — detects intent and writes to state["intent"].
         def route_node(state: OrchestratorState) -> OrchestratorState:
             intent = self._route(state["query"])
             return {**state, "intent": intent.value}
 
-        # Agent node factory — one closure per intent.
         def _agent_node(target: Intent):
             def _node(state: OrchestratorState) -> OrchestratorState:
                 try:
                     resp = self._agents[target].run(state["query"])
                     return {**state, "response": resp}
                 except Exception as exc:
-                    err_resp = AgentResponse(
+                    err = AgentResponse(
                         output=f"Agent error: {exc}",
                         agent_name=target.value,
                         error=str(exc),
                     )
-                    return {**state, "response": err_resp, "error": str(exc)}
+                    return {**state, "response": err, "error": str(exc)}
             _node.__name__ = f"{target.value}_node"
             return _node
 
-        # Dispatch function — reads state["intent"] → returns node name.
         def dispatch(state: OrchestratorState) -> str:
             return state.get("intent", Intent.CHAT.value)
 
-        # Register nodes.
         graph.add_node("router",   route_node)
         graph.add_node("chat",     _agent_node(Intent.CHAT))
         graph.add_node("code",     _agent_node(Intent.CODE))
@@ -649,11 +968,9 @@ class Orchestrator:
         graph.add_node("document", _agent_node(Intent.DOCUMENT))
         graph.add_node("finance",  _agent_node(Intent.FINANCE))
 
-        # Entry + conditional edges.
         graph.set_entry_point("router")
         graph.add_conditional_edges(
-            "router",
-            dispatch,
+            "router", dispatch,
             {
                 Intent.CHAT.value:     "chat",
                 Intent.CODE.value:     "code",
@@ -664,8 +981,8 @@ class Orchestrator:
                 Intent.FINANCE.value:  "finance",
             },
         )
-        for node_name in ("chat", "code", "news", "search", "document", "finance"):
-            graph.add_edge(node_name, END)
+        for node in ("chat", "code", "news", "search", "document", "finance"):
+            graph.add_edge(node, END)
 
         return graph.compile()
 
@@ -678,13 +995,12 @@ class Orchestrator:
         return intent if intent is not None else _llm_route(query)
 
     def _load_plugins(self) -> None:
-        """Discover and inject plugins from plugins/ and entry-points."""
         try:
             from plugins import load_all_plugins
             agent_classes, _ = load_all_plugins()
             for name, cls in agent_classes.items():
                 try:
-                    self._agents[name] = cls(memory=self._memory)  # type: ignore[index]
+                    self._agents[name] = cls(memory=self._memory)  # type: ignore
                     logger.info("Plugin agent '%s' registered.", name)
                 except Exception as exc:
                     logger.warning("Plugin '%s' failed: %s", name, exc)
@@ -692,15 +1008,11 @@ class Orchestrator:
             logger.debug("Plugin loading skipped: %s", exc)
 
     def _open_trace(self, query: str):
-        """Open a trace context manager; returns None on failure."""
         try:
             from core.tracing import get_tracer
-            # Return the internal Trace object directly (not the context manager)
-            # to avoid __enter__/__exit__ complexity in the run() path.
-            import time as _time
             from core.tracing.tracer import Trace
             tracer = get_tracer()
-            trace = Trace(
+            trace  = Trace(
                 trace_id=tracer._next_id(),
                 session_id=self._session_id,
                 query=query,
@@ -710,7 +1022,6 @@ class Orchestrator:
             return None
 
     def _close_trace(self, trace_ctx, response: AgentResponse) -> None:
-        """Finalise and record the trace."""
         if trace_ctx is None:
             return
         try:
@@ -725,18 +1036,16 @@ class Orchestrator:
             logger.debug("Trace record failed: %s", exc)
 
     def _inject_episodic_context(self, query: str, kwargs: dict) -> None:
-        """Retrieve relevant past facts and add them to kwargs."""
         try:
-            context = self._episodic.recall_as_context(query)  # type: ignore[union-attr]
+            context = self._episodic.recall_as_context(query)  # type: ignore
             if context:
                 kwargs.setdefault("episodic_context", context)
         except Exception as exc:
             logger.debug("Episodic recall failed: %s", exc)
 
     def _store_episodic_facts(self, query: str, output: str) -> None:
-        """Extract memorable facts from the agent response (non-blocking)."""
         try:
-            self._episodic.extract_and_store(  # type: ignore[union-attr]
+            self._episodic.extract_and_store(  # type: ignore
                 session_id=self._session_id,
                 user_query=query,
                 agent_response=output,
@@ -745,9 +1054,10 @@ class Orchestrator:
             logger.debug("Episodic store failed: %s", exc)
 
     def __repr__(self) -> str:
-        agents_str = ", ".join(i.value if isinstance(i, Intent) else str(i)
-                               for i in self._agents)
+        agents_str = ", ".join(
+            i.value if isinstance(i, Intent) else str(i) for i in self._agents
+        )
         return (
             f"<Orchestrator session='{self._session_id}' "
-            f"agents=[{agents_str}]>"
+            f"agents=[{agents_str}] fallback_max={self._max_fallback_attempts}>"
         )

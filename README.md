@@ -34,16 +34,14 @@ cd virtual-assistant
 bash start.sh
 ```
 
-`start.sh` handles everything on first run: creates a virtualenv, installs all Python
-dependencies, copies `.env`, creates data directories, starts Ollama, and pulls the
-configured model. Subsequent runs detect completed steps and skip them.
+`start.sh` handles everything on first run: creates a virtualenv, installs all Python dependencies, copies `.env`, creates data directories, starts Ollama, and pulls the configured model. Subsequent runs detect completed steps and skip them.
 
 ```bash
 bash start.sh --help                                   # all options
 bash start.sh voice                                    # mic + TTS
 bash start.sh api                                      # FastAPI server on :8080
 bash start.sh docker                                   # full Docker Compose stack
-bash start.sh test                                     # run the 511-test suite
+bash start.sh test                                     # run the 597-test suite
 bash start.sh --query "Explain recursion like I'm five"
 bash start.sh --ingest ./reports/
 bash start.sh --model llama3.2:3b                      # lighter model
@@ -57,6 +55,7 @@ bash start.sh --backend vllm api                       # GPU + API server
 | Capability | Detail |
 |---|---|
 | **6 specialist agents** | Chat · Code · News · Search · Document · Finance — auto-routed by intent |
+| **Fallback loop** | If the primary agent fails, the orchestrator tries fallback agents then synthesises |
 | **Direct LLM chat** | ChatAgent talks straight to the model with full conversation history |
 | **Document Q&A** | Ingest PDF, DOCX, XLSX, PPTX, TXT, MD, CSV, HTML, JSON, XML |
 | **Mass document upload** | Concurrent batch ingestion with type detection, deduplication, and dry-run |
@@ -100,11 +99,10 @@ bash start.sh --backend vllm api                       # GPU + API server
 │  ┌──────┬──────┬──────┬──────────┬──────────┬──────────┐                 │
 │  │ Chat │ Code │ News │  Search  │ Document │ Finance  │                 │
 │  │Agent │Agent │Agent │  Agent   │  Agent   │  Agent   │                 │
-│  └──────┴──────┴──────┴──────────┴──────────┴──────────┘                 │ 
+│  └──────┴──────┴──────┴──────────┴──────────┴──────────┘                 │
 │                                                                          │
-│  Post-processing pipeline (after every agent call)                       │
-│    PersistentMemory.save()  ·  EpisodicMemory.extract_and_store()        │
-│    ConversationSummariser.maybe_summarise()  ·  Tracer.record()          │
+│  Quality gate → fallback chain → synthesis (when needed)                 │
+│  Post-processing: memory · episodic · summariser · tracing               │
 └──────────────────────────────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────────────────────────┐
@@ -123,7 +121,7 @@ bash start.sh --backend vllm api                       # GPU + API server
 │  logging           JsonFormatter · AssistantLogger · agent_call()        │
 │  voice             Whisper STT · MicrophoneListener VAD · pyttsx3 TTS    │
 └──────────────────────────────────────────────────────────────────────────┘
-
+`
 ┌──────────────────────────────────────────────────────────────────────────┐
 │                       Document Processing                                │
 │                                                                          │
@@ -141,48 +139,38 @@ bash start.sh --backend vllm api                       # GPU + API server
 
 ### Intent Routing
 
-Two-stage pipeline — Stage 1 is regex (< 1 ms, no LLM call); Stage 2 calls the LLM
-only when Stage 1 is ambiguous:
+Two-stage pipeline — Stage 1 is regex (< 1 ms, no LLM call); Stage 2 calls the LLM only when Stage 1 is ambiguous:
 
 ```
-"Hello, how are you?"              →  CHAT     (greeting keyword)
-"Write a haiku about autumn"       →  CHAT     (creative "write a haiku")
-"Write a quicksort in Python"      →  CODE     (code noun after "write")
-"Debug this TypeError"             →  CODE     (debug keyword)
-"What are today's headlines?"      →  NEWS     (headlines keyword)
-"Summarise the uploaded PDF"       →  DOCUMENT (document keyword)
-"What is Apple's stock price?"     →  FINANCE  (stock price keyword)
-"AAPL P/E ratio"                   →  FINANCE  (ratio keyword)
-"What is the capital of France?"   →  SEARCH   (no other signals)
-"Anything ambiguous…"              →  LLM classifies → defaults to CHAT
+"Hello, how are you?"             →  CHAT     (greeting keyword)
+"Write a haiku about autumn"      →  CHAT     (creative "write a haiku")
+"Write a quicksort in Python"     →  CODE     (code noun after "write")
+"Debug this TypeError"            →  CODE     (debug keyword)
+"What are today's headlines?"    →  NEWS     (headlines keyword)
+"Summarise the uploaded PDF"      →  DOCUMENT (document keyword)
+"What is Apple's stock price?"   →  FINANCE  (stock price keyword)
+"AAPL P/E ratio"                  →  FINANCE  (ratio keyword)
+"What is the capital of France?"  →  SEARCH   (no other signals)
+"Anything ambiguous…"             →  LLM classifies → defaults to CHAT
 ```
 
 ### Chat Agent
 
-Talks directly to the LLM — no external tools. Chosen for greetings, explanations,
-creative writing, brainstorming, opinions, follow-up questions, and anything
-conversational. Full sliding-window history is injected so context persists across
-many turns. Supports `stream()` for live-typing REPL output.
+Talks directly to the LLM — no external tools. Chosen for greetings, explanations, creative writing, brainstorming, opinions, follow-up questions, and anything conversational. Full sliding-window history is injected so context persists across many turns. Supports `stream()` for live-typing REPL output.
 
 ### Code Agent
 
 Five task types detected automatically:
 
-| Task | Example |
+| Task | Trigger example |
 |---|---|
-| `write` | `"Implement a REST API in TypeScript"` |
-| `write_and_verify` | `"Write a quicksort in Python and test it"` |
-| `review` | `"Refactor this function
-```python
-…"` |
-| `debug` | `"Why does this raise TypeError?"` |
-| `execute` | `"Run this
-```python
-print(42)
-```"` |
+| `write` | "Implement a REST API in TypeScript" |
+| `write_and_verify` | "Write a quicksort in Python and test it" |
+| `review` | "Refactor this function" + pasted code |
+| `debug` | "Why does this raise TypeError?" |
+| `execute` | "Run this" + pasted Python snippet |
 
-For `write_and_verify`, code is generated, executed in a subprocess sandbox, and
-automatically fixed by the reviewer if execution fails — then re-run.
+For `write_and_verify`, code is generated, executed in a subprocess sandbox, and automatically fixed by the reviewer if execution fails — then re-run.
 
 ### Document Agent
 
@@ -212,13 +200,86 @@ Eight task types with direct tool routing (no ReAct loop for known patterns):
 | `history` | `price_history` |
 | `statements` | `financial_statements` |
 | `compare` | `stock_comparison` |
-| `analysis` | `stock_quote + company_info + financial_ratios + price_history` |
+| `analysis` | `stock_quote` + `company_info` + `financial_ratios` + `price_history` |
 | `unknown` | ReAct executor (all 6 tools) |
 
-Company names resolve to tickers automatically: `"Apple"` → `AAPL`,
-`"Microsoft"` → `MSFT`, `"Bitcoin"` → `BTC-USD` (70+ entries in the lookup map).
-Data comes from Yahoo Finance via yfinance; the LLM's training knowledge is used
-as a fallback when the network is restricted.
+Company names resolve to tickers automatically: `"Apple"` → `AAPL`, `"Microsoft"` → `MSFT`, `"Bitcoin"` → `BTC-USD` (70+ entries in the lookup map). Data comes from Yahoo Finance via yfinance; the LLM's training knowledge is used as a fallback when the network is restricted.
+
+---
+
+## Orchestrator — Fallback Loop
+
+When the primary agent does not produce a satisfactory answer, the orchestrator automatically iterates through a per-intent fallback chain until a sufficient response is found or all options are exhausted.
+
+### Quality gates
+
+After every agent call the response is evaluated against fast-path gates (no LLM call, no latency penalty):
+
+| Signal | Fail condition |
+|---|---|
+| Error flag | `response.error` is set |
+| Too short | Output is fewer than 40 characters |
+| Failure phrase | Output contains "I don't know", "cannot find", "no results found", "failed to retrieve", or 16 other phrases |
+
+When `enable_llm_quality_check=True` the orchestrator also asks the LLM `"SUFFICIENT or INSUFFICIENT?"` after each agent call. This is more accurate but incurs a latency and token cost — off by default.
+
+### Fallback chains
+
+| Primary intent | Fallback order |
+|---|---|
+| `DOCUMENT` | SEARCH → CHAT |
+| `SEARCH` | DOCUMENT → CHAT |
+| `NEWS` | SEARCH → CHAT |
+| `FINANCE` | SEARCH → CHAT |
+| `CODE` | SEARCH → CHAT |
+| `CHAT` | SEARCH |
+| `UNKNOWN` | CHAT |
+
+### Execution flow
+
+```
+query
+  │
+  ▼
+Primary agent  (intent-routed)
+  │
+  ├── SUFFICIENT ──────────────────────────────────► post-process & return
+  │
+  └── INSUFFICIENT
+        │
+        ├── Fallback agent 1 ──► quality check
+        │       ├── SUFFICIENT ──────────────────► post-process & return
+        │       └── INSUFFICIENT
+        │
+        ├── Fallback agent 2 ──► quality check
+        │       ├── SUFFICIENT ──────────────────► post-process & return
+        │       └── INSUFFICIENT
+        │
+        └── Synthesis (LLM merges all evidence) ► post-process & return
+```
+
+### Synthesis
+
+When every agent in the chain fails, `_synthesise_from_attempts()` combines all non-empty partial outputs, tool calls, and references into a single prompt and asks the LLM to produce the best possible answer from the available evidence. The synthesised response carries `agent_name="synthesised"`.
+
+### Configuration
+
+```python
+from agents.orchestrator import Orchestrator
+
+# Default: up to 2 fallback agents, fast quality gates only
+orch = Orchestrator(
+    session_id               = "alice",
+    max_fallback_attempts    = 2,      # cap retries (0 = disable fallback)
+    enable_llm_quality_check = False,  # opt-in LLM judge (slower, more accurate)
+)
+
+# Disable fallback entirely for deterministic pipelines
+orch = Orchestrator(max_fallback_attempts=0)
+
+# Maximum accuracy: LLM judge + 3 fallback attempts
+orch = Orchestrator(enable_llm_quality_check=True, max_fallback_attempts=3)
+```
 
 ---
 
@@ -239,15 +300,14 @@ python admin/admin_cli.py kb bulk ./documents/ --workers 8
 # API
 curl -X POST "http://localhost:8080/documents/bulk-ingest?directory=./reports/"
 
-# Agent (inside the REPL or via API)
+# Agent (REPL or API)
 :agent document
 > Index all files in the ./quarterly_reports/ directory
 ```
 
 ### Type detection
 
-Every file is classified before parsing. Two-stage detection: extension-first (fast),
-then magic-byte content sniffing for files with wrong or missing extensions.
+Every file is classified before parsing. Two-stage detection: extension-first (fast), then magic-byte content sniffing for files with wrong or missing extensions.
 
 | Format | Extensions | Strategy |
 |---|---|---|
@@ -262,9 +322,7 @@ then magic-byte content sniffing for files with wrong or missing extensions.
 
 ### Deduplication
 
-Content-hash (SHA-256) deduplication prevents re-ingesting unchanged files,
-even when the filename changes. Pre-populate `dedup_hashes` to skip files
-already known from a previous session.
+Content-hash (SHA-256) deduplication prevents re-ingesting unchanged files, even when the filename changes. Pre-populate `dedup_hashes` to skip files already known from a previous session.
 
 ### Dry run
 
@@ -285,9 +343,12 @@ uploader = MassUploader(max_workers=4)
 report   = uploader.upload_directory("./reports/")
 print(report.summary())
 
-# report.ok_count, .duplicate_count, .error_count
-# report.total_chunks_added, .total_elapsed_ms
-# report.outcomes  → list[FileOutcome] per file
+# report.ok_count          — files successfully ingested
+# report.duplicate_count   — files skipped (same content hash)
+# report.error_count       — files that failed
+# report.total_chunks_added
+# report.total_elapsed_ms
+# report.outcomes          — list[FileOutcome] with per-file detail
 ```
 
 ---
@@ -304,7 +365,7 @@ Modes
   voice     REPL with Whisper STT + TTS
   api       FastAPI server on :8080
   docker    Full Docker Compose stack
-  test      Run the 511-test suite
+  test      Run the 597-test suite
 
 Options
   --query  TEXT   Single query, print response, exit
@@ -322,9 +383,9 @@ Options
 python cli.py chat
 python cli.py chat --voice
 python cli.py ask "Explain SOLID"
-python cli.py ask "Write a sort"          --agent code
-python cli.py ask "Hello!"                --agent chat
-python cli.py ask "Apple stock P/E ratio" --agent finance
+python cli.py ask "Write a sort"           --agent code
+python cli.py ask "Hello!"                 --agent chat
+python cli.py ask "Apple stock P/E ratio"  --agent finance
 
 python cli.py ingest report.pdf
 python cli.py ingest ./docs/ --directory
@@ -403,7 +464,7 @@ Start with `bash start.sh api` or `uvicorn api.server:app --port 8080`.
 | `GET` | `/traces` | Recent request traces |
 | `GET` | `/docs` | Swagger UI |
 
-### Bulk ingest (API)
+### Bulk ingest
 
 ```bash
 # Ingest a directory
@@ -417,13 +478,25 @@ curl -X POST "http://localhost:8080/documents/bulk-ingest?directory=./docs&dry_r
 ```
 
 Response:
+
 ```json
 {
-  "ok": 12, "duplicate": 3, "error": 0, "unsupported": 1,
-  "chunks_added": 847, "elapsed_ms": 14230, "dry_run": false,
+  "ok": 12,
+  "duplicate": 3,
+  "error": 0,
+  "unsupported": 1,
+  "chunks_added": 847,
+  "elapsed_ms": 14230,
+  "dry_run": false,
   "outcomes": [
-    {"file": "Q3.pdf", "status": "ok", "doc_type": "pdf",
-     "strategy": "docling", "chunks_added": 64, "error": null}
+    {
+      "file": "Q3.pdf",
+      "status": "ok",
+      "doc_type": "pdf",
+      "strategy": "docling",
+      "chunks_added": 64,
+      "error": null
+    }
   ]
 }
 ```
@@ -484,9 +557,12 @@ from tools.my_tools import get_my_tools
 class MyAgent(BaseAgent):
     @property
     def name(self): return "my_agent"
+
     @property
     def description(self): return "Does X. Use for: A, B, C."
+
     def get_tools(self): return get_my_tools()
+
     def run(self, query, **kwargs):
         executor = self._build_react_agent()
         result   = executor.invoke({"input": query})
@@ -497,7 +573,11 @@ class MyAgent(BaseAgent):
         )
 ```
 
-Register: `orch.add_agent(Intent.SEARCH, MyAgent(memory=orch.memory))`
+Register in the orchestrator:
+
+```python
+orch.add_agent(Intent.SEARCH, MyAgent(memory=orch.memory))
+```
 
 Or use the plugin system — no core changes needed:
 
@@ -512,9 +592,9 @@ def register_tools():  return [MyTool()]
 ## Evaluation
 
 ```bash
-python evaluation/run_evals.py --suite smoke     # quick: one case per agent
-python evaluation/run_evals.py --suite financial # financial agent quality
-python evaluation/run_evals.py --suite chat      # conversational quality
+python evaluation/run_evals.py --suite smoke      # quick: one case per agent
+python evaluation/run_evals.py --suite financial  # financial agent quality
+python evaluation/run_evals.py --suite chat       # conversational quality
 python evaluation/run_evals.py --suite all --save
 python evaluation/run_evals.py --list
 ```
@@ -565,7 +645,7 @@ docker compose run -it --rm assistant
 
 ```bash
 make install-dev    # venv + all deps + dev extras
-make test           # 511 tests
+make test           # 597 tests
 make test-cov       # with HTML coverage → data/coverage/
 make test-unit      # unit tests only
 make test-api       # API tests only
@@ -585,104 +665,106 @@ make run-api        # FastAPI with auto-reload
 ```
 virtual-assistant/
 │
-├── start.sh                       ← single entry point (setup + all modes)
-├── .env                           ← your configuration (git-ignored)
-├── .env.example                   ← template with all settings documented
+├── start.sh                            ← single entry point (setup + all modes)
+├── .env                                ← your configuration (git-ignored)
+├── .env.example                        ← template with all settings documented
 │
 ├── agents/
-│   ├── base_agent.py              abstract BaseAgent + AgentResponse
-│   ├── chat_agent.py              direct LLM chat, history injection, streaming
-│   ├── code_agent.py              5-task router: write/verify/review/debug/execute
-│   ├── news_agent.py              RSS + DuckDuckGo news aggregation
-│   ├── search_agent.py            4-route: math/URL/encyclopedic/multi-source
-│   ├── document_agent.py          7 tools: ingest, bulk ingest, search, manage
-│   ├── financial_agent.py         8-task router, company-name resolution, yfinance
-│   └── orchestrator.py            Intent enum · OrchestratorState · 2-stage routing
-│                                  post-processing pipeline · LangGraph graph
+│   ├── base_agent.py                   abstract BaseAgent + AgentResponse
+│   ├── chat_agent.py                   direct LLM chat, history injection, streaming
+│   ├── code_agent.py                   5-task router: write/verify/review/debug/execute
+│   ├── news_agent.py                   RSS + DuckDuckGo news aggregation
+│   ├── search_agent.py                 4-route: math/URL/encyclopedic/multi-source
+│   ├── document_agent.py               7 tools: ingest, bulk ingest, search, manage
+│   ├── financial_agent.py              8-task router, company-name resolution, yfinance
+│   └── orchestrator.py                 Intent enum · 2-stage routing · fallback loop
+│                                       quality gates · synthesis · LangGraph graph
 │
 ├── core/
-│   ├── llm_manager.py             Ollama / vLLM factory + @lru_cache singleton
-│   ├── async_runner/              AsyncAgentRunner · fan-out · streaming
-│   ├── cache/                     ToolCache (TTL, LRU, disk) · @cached_tool
-│   ├── logging/                   JsonFormatter · AssistantLogger
-│   ├── long_term_memory/          EpisodicMemory (ChromaDB, cross-session)
-│   ├── memory/                    ConversationMemory · PersistentMemory
-│   ├── resilience/                ResilientLLM · CircuitBreaker · retry
-│   ├── scheduler/                 TaskScheduler + 4 built-in tasks
-│   ├── summariser/                ConversationSummariser (rolling compression)
-│   ├── tracing/                   Tracer · Span · TraceStore (JSONL)
-│   ├── user_prefs/                UserPreferences (Pydantic, disk-persisted)
-│   └── voice/                     Whisper STT · MicrophoneListener · pyttsx3 TTS
+│   ├── llm_manager.py                  Ollama / vLLM factory + @lru_cache singleton
+│   ├── async_runner/                   AsyncAgentRunner · fan-out · streaming
+│   ├── cache/                          ToolCache (TTL, LRU, disk) · @cached_tool
+│   ├── logging/                        JsonFormatter · AssistantLogger
+│   ├── long_term_memory/               EpisodicMemory (ChromaDB, cross-session)
+│   ├── memory/                         ConversationMemory · PersistentMemory
+│   ├── resilience/                     ResilientLLM · CircuitBreaker · retry
+│   ├── scheduler/                      TaskScheduler + 4 built-in tasks
+│   ├── summariser/                     ConversationSummariser (rolling compression)
+│   ├── tracing/                        Tracer · Span · TraceStore (JSONL)
+│   ├── user_prefs/                     UserPreferences (Pydantic, disk-persisted)
+│   └── voice/                          Whisper STT · MicrophoneListener · pyttsx3 TTS
 │
 ├── document_processing/
-│   ├── __init__.py                exports all public symbols incl. IngestResult
-│   ├── type_detector.py           12 types · 17 extensions · magic-byte sniffing
-│   │                              DocumentTypeInfo · ExtractionStrategy
-│   ├── docling_processor.py       Docling → DocumentChunk with breadcrumb refs
-│   ├── document_manager.py        IngestResult · KnowledgeBaseStats
-│   │                              ingest/search/list/delete · LangChain retriever
-│   ├── mass_uploader.py           MassUploader · FileOutcome · UploadReport
-│   │                              concurrent · dedup · dry-run · progress hooks
-│   └── vector_store.py            ChromaDB · cosine similarity · idempotent ingest
+│   ├── __init__.py                     exports all public symbols incl. IngestResult
+│   ├── type_detector.py                12 types · 17 extensions · magic-byte sniffing
+│   ├── docling_processor.py            Docling → DocumentChunk with breadcrumb refs
+│   ├── document_manager.py             IngestResult · KnowledgeBaseStats
+│   │                                   ingest/search/list/delete · LangChain retriever
+│   ├── mass_uploader.py                MassUploader · FileOutcome · UploadReport
+│   │                                   concurrent · dedup · dry-run · progress hooks
+│   └── vector_store.py                 ChromaDB · cosine similarity · idempotent ingest
 │
 ├── tools/
-│   ├── code_tools.py              CodeWriter · CodeReviewer · Executor
-│   ├── document_tools.py          Ingest · BulkIngestDirectory · BulkIngestFiles
-│   │                              Search · List · Get · Delete
-│   ├── financial_tools.py         StockQuote · CompanyInfo · Statements · Ratios
-│   │                              PriceHistory · StockComparison
-│   │                              (yfinance primary · LLM knowledge fallback)
-│   ├── news_tools.py              Headlines · TopicNews · RSSFeed
-│   └── search_tools.py            DuckDuckGo · Wikipedia · WebFetch · Calculator
+│   ├── code_tools.py                   CodeWriter · CodeReviewer · Executor
+│   ├── document_tools.py               Ingest · BulkIngestDirectory · BulkIngestFiles
+│   │                                   Search · List · Get · Delete
+│   ├── financial_tools.py              StockQuote · CompanyInfo · Statements · Ratios
+│   │                                   PriceHistory · StockComparison
+│   │                                   yfinance primary · LLM knowledge fallback
+│   ├── news_tools.py                   Headlines · TopicNews · RSSFeed
+│   └── search_tools.py                 DuckDuckGo · Wikipedia · WebFetch · Calculator
 │
 ├── api/
-│   ├── server.py                  FastAPI app · all endpoints · bulk-ingest route
-│   ├── sse.py                     GET /stream (Server-Sent Events)
-│   ├── rate_limiter.py            RateLimiter · RateLimitMiddleware
-│   └── startup_validator.py       pre-flight checks
+│   ├── server.py                       FastAPI app · all endpoints · bulk-ingest route
+│   ├── sse.py                          GET /stream (Server-Sent Events)
+│   ├── rate_limiter.py                 RateLimiter · RateLimitMiddleware
+│   └── startup_validator.py            pre-flight checks
 │
 ├── ui/
-│   └── index.html                 self-contained dark-mode web client
+│   └── index.html                      self-contained dark-mode web client
 │
 ├── evaluation/
-│   ├── eval_harness.py            10 criteria · EvalSuite · Evaluator · EvalReport
-│   ├── builtin_suites.py          smoke·chat·code·news·search·document·financial·routing
-│   └── run_evals.py               CLI runner
+│   ├── eval_harness.py                 10 criteria · EvalSuite · Evaluator · EvalReport
+│   ├── builtin_suites.py               smoke · chat · code · news · search
+│   │                                   document · financial · routing
+│   └── run_evals.py                    CLI runner
 │
 ├── plugins/
-│   ├── plugin_loader.py           discovery · inject_into_orchestrator()
-│   └── example_calendar_plugin.py complete working demo
+│   ├── plugin_loader.py                discovery · inject_into_orchestrator()
+│   └── example_calendar_plugin.py      complete working demo
 │
 ├── admin/
-│   └── admin_cli.py               sessions·kb·kb bulk·traces·cache·prefs·scheduler
+│   └── admin_cli.py                    sessions · kb · kb bulk · traces
+│                                       cache · prefs · scheduler · health
 │
-├── tests/                         511 tests · 13 test files · autouse LLM mock
+├── tests/                              597 tests · 14 test files · autouse LLM mock
 │   ├── conftest.py
-│   ├── test_agents.py             (19 tests)
-│   ├── test_chat_agent.py         (33 tests)
-│   ├── test_api.py                (21 tests)
-│   ├── test_advanced_modules.py   (34 tests)
-│   ├── test_document_processing.py (15 tests)
-│   ├── test_final_modules.py      (25 tests)
-│   ├── test_financial_agent.py    (56 tests)
-│   ├── test_integration.py        (10 tests)
-│   ├── test_mass_uploader.py      (127 tests)
-│   ├── test_new_modules.py        (41 tests)
-│   ├── test_rate_limiter.py       (18 tests)
-│   ├── test_tools.py              (23 tests)
-│   └── test_voice.py              (4 tests)
+│   ├── test_agents.py                  (19)
+│   ├── test_advanced_modules.py        (34)
+│   ├── test_api.py                     (21)
+│   ├── test_chat_agent.py              (33)
+│   ├── test_document_processing.py     (15)
+│   ├── test_final_modules.py           (25)
+│   ├── test_financial_agent.py         (56)
+│   ├── test_integration.py             (10)
+│   ├── test_mass_uploader.py           (127)
+│   ├── test_new_modules.py             (41)
+│   ├── test_orchestrator.py            (86)
+│   ├── test_rate_limiter.py            (18)
+│   ├── test_tools.py                   (23)
+│   └── test_voice.py                   (4)
 │
 ├── scripts/
-│   ├── install.sh                 dev environment setup
-│   ├── setup_ollama.sh            pull Ollama models
-│   └── start_vllm.sh              launch vLLM server
+│   ├── install.sh                      dev environment setup
+│   ├── setup_ollama.sh                 pull Ollama models
+│   └── start_vllm.sh                   launch vLLM server
 │
-├── .github/workflows/ci.yml       lint · test matrix · coverage · Docker · audit
-├── Dockerfile                     multi-stage (builder + slim runtime)
-├── docker-compose.yml             Ollama + assistant + optional vLLM GPU profile
+├── .github/workflows/ci.yml            lint · test matrix · coverage · Docker · audit
+├── Dockerfile                          multi-stage (builder + slim runtime)
+├── docker-compose.yml                  Ollama + assistant + optional vLLM GPU profile
 ├── Makefile
-├── pyproject.toml                 pytest · ruff · black · mypy · coverage config
-├── requirements.txt               all pinned dependencies (setuptools<81 for vllm)
+├── pyproject.toml                      pytest · ruff · black · mypy · coverage config
+├── requirements.txt                    all pinned dependencies (setuptools<81 for vllm)
 └── CHANGELOG.md
 ```
 

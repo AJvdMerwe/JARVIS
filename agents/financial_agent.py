@@ -89,11 +89,11 @@ class FinancialAgent(BaseAgent):
     """
 
     def __init__(
-        self,
-        llm: Optional[BaseChatModel] = None,
-        memory: Optional[AssistantMemory] = None,
-        verbose: bool = False,
-        add_disclaimer: bool = True,
+            self,
+            llm: Optional[BaseChatModel] = None,
+            memory: Optional[AssistantMemory] = None,
+            verbose: bool = False,
+            add_disclaimer: bool = True,
     ) -> None:
         super().__init__(llm=llm, memory=memory, verbose=verbose)
         self._executor       = self._build_react_agent(system_prompt=_SYSTEM_PROMPT)
@@ -158,6 +158,12 @@ class FinancialAgent(BaseAgent):
             tickers = kwargs.get("ticker") or self._extract_tickers(query)
             period  = self._extract_period(query)
             stmt    = self._extract_statement_type(query)
+
+            # If no ticker was found via regex/name-map, ask the LLM to identify it
+            if not tickers:
+                resolved = self._resolve_ticker(query)
+                if resolved:
+                    tickers = [resolved]
 
             self._logger.debug(
                 "task=%s  tickers=%s  period=%s  stmt=%s",
@@ -315,17 +321,24 @@ class FinancialAgent(BaseAgent):
     )
     _RATIOS_PATTERNS = re.compile(
         r"\b(ratio|p/?e|p/?b|p/?s|peg|ev/?ebitda|roe|roa|"
-        r"return on (equity|assets)|margin|valuation|"
+        r"return on (equity|assets)|margin(s)?|valuation|"
         r"overvalued|undervalued|cheap|expensive|"
         r"debt.to.equity|leverage|liquidity|current ratio|"
-        r"profitab|dividend yield|payout)\b",
+        r"dividend yield|payout)|"
+        r"\bprofitab|\bprofit margin|\bmetric",  # prefix matches — no trailing \b
         re.IGNORECASE,
     )
     _HISTORY_PATTERNS = re.compile(
-        r"\b(history|historical|performance|return|gain|loss|"
-        r"how.{0,10} (done|performed|changed)|"
-        r"since|over the (last|past)|ytd|year.to.date|"
-        r"volatility|drawdown|trend|chart|cagr|annualised)\b",
+        r"\b(history|historical|stock performance|price history|"
+        r"price performance|performance (over|in|last|past)|"
+        r"how.{0,15} (done|performed|changed)|"
+        r"(over|in) the (last|past) \d|"
+        r"since \d{4}|ytd|year.to.date|"
+        r"(past|last) (week|month|year|quarter|decade)|"
+        r"\d+ year(s)? (history|performance|return)|"
+        r"\d+ (year|month|week)s? ago|"
+        r"annuali[sz]ed return|total return|"
+        r"volatility|drawdown|trend analysis|cagr)\b",
         re.IGNORECASE,
     )
     _STATEMENT_PATTERNS = re.compile(
@@ -354,37 +367,59 @@ class FinancialAgent(BaseAgent):
         """
         Classify the query into one of:
         quote · profile · ratios · history · statements · compare · analysis · unknown
-        """
-        # Compare requires multiple tickers — check first
-        tickers = self._extract_tickers(query)
-        if len(tickers) >= 2 and self._COMPARE_PATTERNS.search(query):
-            return "compare"
 
-        # Analysis is a superset — check before ratios / history
+        Priority (highest → lowest):
+          compare > analysis > ratios > statements > history > quote > profile > unknown
+        Compare only fires when a compare keyword is present — multiple tickers alone
+        are not sufficient to avoid false positives on ratio/history queries.
+        """
+        tickers = self._extract_tickers(query)
+
+        # Analysis is the broadest — check before everything else
         if self._ANALYSIS_PATTERNS.search(query):
             return "analysis"
 
-        # Statement queries contain very specific keywords
-        if self._STATEMENT_PATTERNS.search(query):
-            return "statements"
+        # Compare: explicit compare keyword + multiple tickers
+        if self._COMPARE_PATTERNS.search(query) and len(tickers) >= 2:
+            return "compare"
 
-        if self._RATIOS_PATTERNS.search(query):
-            return "ratios"
-
+        # History: performance-over-time language — check BEFORE ratios to
+        # prevent "profitability" from capturing "how has X performed?" queries
         if self._HISTORY_PATTERNS.search(query):
             return "history"
 
-        if self._PROFILE_PATTERNS.search(query):
-            return "profile"
+        # Statements: specific financial statement line items
+        # Exclude generic "equity" since that fires inside ratios too
+        stmt_match = self._STATEMENT_PATTERNS.search(query)
+        if stmt_match and stmt_match.group(0).lower() not in ("equity", "earnings"):
+            return "statements"
+        # Re-allow equity/earnings if stronger statement signals also present
+        if stmt_match and any(
+                kw in query.lower()
+                for kw in ("income statement", "balance sheet", "cash flow",
+                           "revenue", "net income", "ebitda", "quarterly results",
+                           "annual results", "fiscal")
+        ):
+            return "statements"
 
+        # Ratios: explicit ratio / profitability / valuation language
+        if self._RATIOS_PATTERNS.search(query):
+            return "ratios"
+
+        # Quote: price / market-cap specific language — must come BEFORE profile
+        # so "what is X's price?" doesn't get caught by the "what is" profile pattern
         if self._QUOTE_PATTERNS.search(query):
             return "quote"
 
-        # Multiple tickers without a compare keyword → comparison
+        # Profile: general company description queries
+        if self._PROFILE_PATTERNS.search(query):
+            return "profile"
+
+        # Multiple tickers with no other signal → comparison
         if len(tickers) >= 2:
             return "compare"
 
-        # Single ticker with no other signal → quote is safest default
+        # Single ticker with no other signal → quote
         if tickers:
             return "quote"
 
@@ -392,11 +427,10 @@ class FinancialAgent(BaseAgent):
 
     # ── Ticker extraction ─────────────────────────────────────────────────────
 
-    # Common ticker patterns: 1-5 uppercase letters, optionally with . or -
-    # (e.g. BRK.B, BTC-USD)
+    # Regex: explicit ticker symbols written in UPPERCASE (AAPL, BRK.B, BTC-USD)
     _TICKER_RE = re.compile(r"\b([A-Z]{1,5}(?:[.\-][A-Z]{1,5})?)\b")
 
-    # Words that look like tickers but aren't
+    # Generic English words that are not ticker symbols
     _STOPWORDS = frozenset({
         "A", "I", "AT", "AS", "BE", "BY", "DO", "IN", "IS", "IT", "ME",
         "MY", "NO", "OF", "ON", "OR", "SO", "TO", "UP", "US", "VS",
@@ -404,40 +438,198 @@ class FinancialAgent(BaseAgent):
         "HAS", "HAD", "HOW", "ITS", "LET", "MAY", "NOT", "NOW", "OFF",
         "OUT", "OWN", "SAY", "SHE", "SIX", "TEN", "TOO", "TWO", "USE",
         "VIA", "WAS", "WHO", "WHY", "YET", "YOU",
-        # Finance-adjacent words that are not tickers
+        "PRICE", "STOCK", "SHARE", "DATA", "SHOW", "LAST", "NEXT",
+        "YEARS", "YEAR", "MONTH", "WEEK", "DAYS", "HOUR", "MINS",
+        "HIGH", "LOWS", "OPEN", "CLOSE", "SELL", "HOLD",
+        "TELL", "GIVE", "WHAT", "WHEN", "WHERE", "WILL", "BEEN",
+        "WELL", "GOOD", "BEST", "FULL", "OVER",
+        "FROM", "WITH", "THIS", "THAT", "THEM", "THEY", "THAN",
+        "HAVE", "HERE", "INTO", "JUST", "LIKE", "MAKE", "MANY",
+        "MORE", "MOST", "MUCH", "NEED", "ONLY", "SOME", "SUCH",
+        "TAKE", "THEN", "WERE", "WOULD", "ABOUT", "AFTER",
+        # Finance abbreviations
         "EPS", "P", "Q", "YTD", "ROE", "ROA", "ETF", "CEO", "CFO",
-        "IPO", "GDP", "FED", "ECB",
+        "IPO", "GDP", "FED", "ECB", "PE", "PB", "PS", "PEG",
+        "CAGR", "EBIT", "CAPEX", "OPEX", "FCF", "TTM", "LTM",
     })
+
+    # Company-name → ticker map for the most commonly queried companies.
+    # Covers plain English names that users type without knowing the ticker.
+    _COMPANY_NAME_MAP: dict[str, str] = {
+        # Big Tech
+        "apple":        "AAPL",
+        "microsoft":    "MSFT",
+        "google":       "GOOGL",
+        "alphabet":     "GOOGL",
+        "amazon":       "AMZN",
+        "meta":         "META",
+        "facebook":     "META",
+        "netflix":      "NFLX",
+        "nvidia":       "NVDA",
+        "tesla":        "TSLA",
+        "intel":        "INTC",
+        "amd":          "AMD",
+        "qualcomm":     "QCOM",
+        "broadcom":     "AVGO",
+        "salesforce":   "CRM",
+        "oracle":       "ORCL",
+        "ibm":          "IBM",
+        "cisco":        "CSCO",
+        "adobe":        "ADBE",
+        "paypal":       "PYPL",
+        "uber":         "UBER",
+        "lyft":         "LYFT",
+        "twitter":      "TWTR",
+        "x corp":       "TWTR",
+        "snap":         "SNAP",
+        "spotify":      "SPOT",
+        "airbnb":       "ABNB",
+        "palantir":     "PLTR",
+        "shopify":      "SHOP",
+        "square":       "SQ",
+        "block":        "SQ",
+        "coinbase":     "COIN",
+        "robinhood":    "HOOD",
+        # Finance
+        "jpmorgan":     "JPM",
+        "jp morgan":    "JPM",
+        "goldman sachs":"GS",
+        "goldman":      "GS",
+        "morgan stanley":"MS",
+        "bank of america":"BAC",
+        "bofa":         "BAC",
+        "wells fargo":  "WFC",
+        "citigroup":    "C",
+        "citi":         "C",
+        "visa":         "V",
+        "mastercard":   "MA",
+        "american express":"AXP",
+        "amex":         "AXP",
+        "blackrock":    "BLK",
+        "berkshire":    "BRK-B",
+        # Healthcare
+        "johnson":      "JNJ",
+        "johnson & johnson":"JNJ",
+        "pfizer":       "PFE",
+        "moderna":      "MRNA",
+        "unitedhealth": "UNH",
+        "abbvie":       "ABBV",
+        "eli lilly":    "LLY",
+        "lilly":        "LLY",
+        "merck":        "MRK",
+        "novartis":     "NVS",
+        # Consumer / Retail
+        "walmart":      "WMT",
+        "costco":       "COST",
+        "target":       "TGT",
+        "home depot":   "HD",
+        "nike":         "NKE",
+        "starbucks":    "SBUX",
+        "mcdonalds":    "MCD",
+        "mcdonald's":   "MCD",
+        "coca cola":    "KO",
+        "coca-cola":    "KO",
+        "pepsi":        "PEP",
+        "pepsico":      "PEP",
+        "procter":      "PG",
+        "procter & gamble":"PG",
+        # Auto
+        "ford":         "F",
+        "general motors":"GM",
+        "gm":           "GM",
+        "toyota":       "TM",
+        "volkswagen":   "VWAGY",
+        "porsche":      "POAHY",
+        # Energy
+        "exxon":        "XOM",
+        "exxonmobil":   "XOM",
+        "chevron":      "CVX",
+        "shell":        "SHEL",
+        # Indices / Crypto
+        "bitcoin":      "BTC-USD",
+        "btc":          "BTC-USD",
+        "ethereum":     "ETH-USD",
+        "eth":          "ETH-USD",
+        "sp500":        "^GSPC",
+        "s&p 500":      "^GSPC",
+        "s&p":          "^GSPC",
+        "dow jones":    "^DJI",
+        "dow":          "^DJI",
+        "nasdaq":       "^IXIC",
+    }
 
     @classmethod
     def _extract_tickers(cls, query: str) -> list[str]:
         """
-        Extract stock ticker symbols from the query.
+        Extract stock ticker symbols from a natural-language query.
 
-        Heuristics:
-        - Must be 1–5 uppercase letters (with optional ./-suffix).
-        - Must not be a known stopword.
-        - Must follow a financial context signal or appear in a parenthetical.
+        Resolution order (highest confidence first):
+          1. Explicit parenthetical form: "Apple (AAPL)" → ["AAPL"]
+          2. Company-name lookup:  "How has Apple performed?" → ["AAPL"]
+          3. Bare UPPERCASE symbols: "TSLA income statement" → ["TSLA"]
+          4. LLM extraction: called by _resolve_ticker() when no match found
+
+        This handles both "AAPL" and "Apple" style references.
         """
-        # First: explicit parenthetical form → "Apple (AAPL)"
-        parens = re.findall(r"\(([A-Z]{1,5}(?:[.\-][A-Z]{1,5})?)\)", query)
-
-        # Second: all-caps words that look like tickers
-        candidates = cls._TICKER_RE.findall(query.upper())
-        filtered   = [
-            t for t in candidates
-            if t not in cls._STOPWORDS and len(t) >= 2
-        ]
-
-        # Merge: parenthetical tickers first (highest confidence), then others
         seen:    set[str]  = set()
         tickers: list[str] = []
-        for t in parens + filtered:
-            if t not in seen:
+
+        def _add(t: str) -> None:
+            t = t.strip().upper()
+            if t and t not in seen:
                 seen.add(t)
                 tickers.append(t)
 
-        return tickers[:5]  # cap at 5
+        # 1. Parenthetical: "Apple (AAPL)"
+        for t in re.findall(r"\(([A-Z]{1,5}(?:[.\-][A-Z]{1,5})?)\)", query):
+            _add(t)
+
+        # 2. Company name lookup (case-insensitive, longest match first)
+        q_lower = query.lower()
+        for name in sorted(cls._COMPANY_NAME_MAP, key=len, reverse=True):
+            if re.search(r"\b" + re.escape(name) + r"\b", q_lower):
+                _add(cls._COMPANY_NAME_MAP[name])
+
+        # 3. Bare UPPERCASE ticker symbols already in the query
+        for t in cls._TICKER_RE.findall(query):   # query is already mixed case
+            if t.upper() not in cls._STOPWORDS and len(t) >= 2:
+                _add(t)
+
+        return tickers[:5]
+
+    @classmethod
+    def _resolve_ticker(cls, query: str) -> Optional[str]:
+        """
+        Return a single best-guess ticker for the query.
+        Tries _extract_tickers first, then asks the LLM as a last resort.
+        Never returns None — falls back to passing the raw query to tools
+        which will use their own LLM fallback.
+        """
+        tickers = cls._extract_tickers(query)
+        if tickers:
+            return tickers[0]
+
+        # LLM extraction: ask the model to identify the company/ticker
+        try:
+            from core.llm_manager import get_llm
+            llm    = get_llm()
+            prompt = (
+                f"Extract the stock ticker symbol from this query: \"{query}\"\n\n"
+                "Rules:\n"
+                "- Return ONLY the ticker symbol (e.g. AAPL, MSFT, TSLA, BTC-USD).\n"
+                "- If you can identify the company, return its primary US exchange ticker.\n"
+                "- If you cannot identify any specific company, return UNKNOWN.\n"
+                "Ticker:"
+            )
+            result = llm.invoke(prompt)
+            ticker = str(result.content).strip().upper().split()[0]
+            if ticker and ticker != "UNKNOWN" and len(ticker) <= 7:
+                logger.info("LLM resolved ticker '%s' from query: %s", ticker, query[:60])
+                return ticker
+        except Exception as exc:
+            logger.debug("LLM ticker resolution failed: %s", exc)
+
+        return None
 
     # ── Period extraction ─────────────────────────────────────────────────────
 

@@ -1,31 +1,28 @@
 """
 tools/financial_tools.py
 ─────────────────────────
-LangChain tools for the Financial Agent, powered by yfinance.
+LangChain tools for the Financial Agent.
 
-Available tools:
-  • StockQuoteTool          – Current price, daily change, volume, market cap.
-  • CompanyInfoTool         – Business description, sector, employees, exchange.
-  • FinancialStatementsTool – Income statement, balance sheet, cash flow
-                              (annual or quarterly).
-  • FinancialRatiosTool     – Valuation, profitability, liquidity and
-                              leverage ratios with plain-English grades.
-  • PriceHistoryTool        – OHLCV history for any period/interval with
-                              derived statistics (return, volatility, CAGR).
-  • StockComparisonTool     – Side-by-side comparison of up to 5 tickers
-                              across key metrics.
+Data retrieval strategy (two-tier):
+  1. yfinance  — attempted first; gives real-time market data when the
+                 network can reach Yahoo Finance.
+  2. LLM fallback — when yfinance raises any network/parse error, the tool
+                    calls get_llm() and asks for the same information from
+                    the model's training knowledge.  This ensures the agent
+                    always returns a useful answer even in offline, sandboxed,
+                    or rate-limited environments.
 
-All tools:
-  • Handle missing data gracefully — yfinance returns None / NaN frequently.
-  • Format numbers to 2 d.p. with appropriate units (B, M, K, %).
-  • Cache-friendly: pure functions of the ticker symbol and parameters.
-  • Work with the @cached_tool decorator in FinancialAgent.
+Tools:
+  StockQuoteTool          – Price, change, volume, market cap, 52-week range.
+  CompanyInfoTool         – Business description, sector, employees, executives.
+  FinancialStatementsTool – Income statement / balance sheet / cash flow.
+  FinancialRatiosTool     – Valuation, profitability, liquidity and leverage.
+  PriceHistoryTool        – Historical performance statistics.
+  StockComparisonTool     – Side-by-side table for up to 5 tickers.
 
-Requires:
-    pip install yfinance
-
-Data comes from Yahoo Finance (free, no API key). Rate limits apply for
-heavy use — the FinancialAgent applies TTL caching to stay within them.
+Ticker handling:
+  Every tool receives the ticker UPPERCASED by the caller.
+  Tools never attempt to re-extract a ticker from free text.
 """
 from __future__ import annotations
 
@@ -43,7 +40,6 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 def _fmt_number(value, prefix: str = "", suffix: str = "") -> str:
-    """Format a numeric value with K/M/B scaling, or return 'N/A'."""
     if value is None:
         return "N/A"
     try:
@@ -62,7 +58,6 @@ def _fmt_number(value, prefix: str = "", suffix: str = "") -> str:
 
 
 def _fmt_pct(value) -> str:
-    """Format a ratio (e.g. 0.0523) as a percentage string."""
     if value is None:
         return "N/A"
     try:
@@ -72,7 +67,6 @@ def _fmt_pct(value) -> str:
 
 
 def _fmt_ratio(value, decimals: int = 2) -> str:
-    """Format a ratio / multiple with N/A fallback."""
     if value is None:
         return "N/A"
     try:
@@ -82,33 +76,35 @@ def _fmt_ratio(value, decimals: int = 2) -> str:
 
 
 def _safe(info: dict, key: str, default=None):
-    """Safely get a key from yfinance info dict, returning default on absence."""
     v = info.get(key, default)
     return default if v in (None, "N/A", float("inf"), float("-inf")) else v
 
 
-def _grade_ratio(metric: str, value: float | None) -> str:
-    """Return a simple qualitative grade for common financial ratios."""
+def _grade_ratio(metric: str, value) -> str:
     if value is None:
         return ""
-    thresholds: dict[str, tuple] = {
-        "pe":        (10, 20, 35),   # low, fair, expensive
-        "pb":        (1, 3, 5),
-        "roe":       (0.15, 0.20, 0.30),   # higher is better; thresholds reversed
-        "roa":       (0.05, 0.10, 0.20),
-        "current":   (1.5, 2.5, 4.0),     # liquidity
-        "de":        (0.5, 1.5, 3.0),     # debt/equity; lower is better
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return ""
+    thresholds = {
+        "pe":      (10, 20, 35),
+        "pb":      (1, 3, 5),
+        "roe":     (0.15, 0.20, 0.30),
+        "roa":     (0.05, 0.10, 0.20),
+        "current": (1.5, 2.5, 4.0),
+        "de":      (0.5, 1.5, 3.0),
     }
     t = thresholds.get(metric)
     if not t:
         return ""
     lo, mid, hi = t
-    if metric in ("roe", "roa", "current"):      # higher = better
+    if metric in ("roe", "roa", "current"):
         if value >= hi:   return "  ★ Excellent"
         if value >= mid:  return "  ✓ Good"
         if value >= lo:   return "  ~ Fair"
         return "  ✗ Weak"
-    else:                                         # lower = better
+    else:
         if value <= lo:   return "  ★ Attractive"
         if value <= mid:  return "  ✓ Fair"
         if value <= hi:   return "  ~ Expensive"
@@ -116,47 +112,63 @@ def _grade_ratio(metric: str, value: float | None) -> str:
 
 
 # =============================================================================
-#  Input schemas
+#  LLM fallback helper
+# =============================================================================
+
+def _llm_fallback(prompt: str, context_label: str) -> str:
+    """
+    Use the configured LLM to answer a financial query when yfinance is
+    unavailable (network restricted, rate-limited, etc.).
+
+    The LLM is instructed to respond from its training knowledge and to
+    clearly note that the data is not live.
+
+    Returns the LLM response, or an informative error string on failure.
+    """
+    try:
+        from core.llm_manager import get_llm
+        llm    = get_llm()
+        result = llm.invoke(prompt)
+        text   = str(result.content).strip()
+        logger.info("LLM knowledge fallback used for: %s", context_label)
+        return text
+    except Exception as exc:
+        logger.error("LLM fallback also failed for %s: %s", context_label, exc)
+        return (
+            f"Unable to retrieve financial data for {context_label}. "
+            f"yfinance is network-restricted and the LLM fallback encountered: {exc}. "
+            "Please run with a network connection to Yahoo Finance."
+        )
+
+
+# =============================================================================
+#  Schemas
 # =============================================================================
 
 class TickerInput(BaseModel):
-    ticker: str = Field(
-        ...,
-        description="Stock ticker symbol, e.g. 'AAPL', 'MSFT', 'BTC-USD'",
-    )
+    ticker: str = Field(...,
+                        description="Stock ticker symbol in UPPERCASE, e.g. AAPL, MSFT, BTC-USD")
 
 
 class TickerPeriodInput(BaseModel):
-    ticker: str = Field(..., description="Stock ticker symbol")
-    period: str = Field(
-        default="1y",
-        description=(
-            "Period of history: 1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, 10y, ytd, max"
-        ),
-    )
-    interval: str = Field(
-        default="1d",
-        description="Data interval: 1m, 5m, 15m, 30m, 60m, 1d, 1wk, 1mo",
-    )
+    ticker:   str = Field(..., description="Stock ticker symbol")
+    period:   str = Field(default="1y",
+                          description="Period: 1d 5d 1mo 3mo 6mo 1y 2y 5y 10y ytd max")
+    interval: str = Field(default="1d",
+                          description="Interval: 1m 5m 15m 30m 60m 1d 1wk 1mo")
 
 
 class StatementInput(BaseModel):
-    ticker: str = Field(..., description="Stock ticker symbol")
-    statement: str = Field(
-        default="income",
-        description="Statement type: 'income', 'balance', or 'cashflow'",
-    )
-    quarterly: bool = Field(
-        default=False,
-        description="If True, return quarterly data; otherwise annual",
-    )
+    ticker:    str  = Field(..., description="Stock ticker symbol")
+    statement: str  = Field(default="income",
+                            description="Statement type: income | balance | cashflow")
+    quarterly: bool = Field(default=False,
+                            description="True for quarterly data, False for annual")
 
 
 class CompareInput(BaseModel):
-    tickers: str = Field(
-        ...,
-        description="Comma-separated ticker symbols, e.g. 'AAPL,MSFT,GOOGL'",
-    )
+    tickers: str = Field(...,
+                         description="Comma-separated tickers, e.g. AAPL,MSFT,GOOGL")
 
 
 # =============================================================================
@@ -164,18 +176,11 @@ class CompareInput(BaseModel):
 # =============================================================================
 
 class StockQuoteTool(BaseTool):
-    """
-    Fetch the current price and key market data for a stock.
-
-    Returns: current price, daily change/%, bid/ask, volume, market cap,
-    52-week range, beta, and trading day summary.
-    """
-
-    name: str = "stock_quote"
+    name: str        = "stock_quote"
     description: str = (
         "Get the current stock price and key market data for a ticker symbol. "
         "Returns price, change, volume, market cap, and 52-week range. "
-        "Use for: 'What is AAPL trading at?', 'Current price of Tesla'."
+        "Use for: What is AAPL trading at?, Current Tesla price."
     )
     args_schema: Type[BaseModel] = TickerInput
 
@@ -183,48 +188,50 @@ class StockQuoteTool(BaseTool):
         ticker = ticker.strip().upper()
         try:
             import yfinance as yf
-            t    = yf.Ticker(ticker)
-            info = t.fast_info
-
-            price       = getattr(info, "last_price", None)
-            prev_close  = getattr(info, "previous_close", None)
-            open_price  = getattr(info, "open", None)
-            day_high    = getattr(info, "day_high", None)
-            day_low     = getattr(info, "day_low", None)
-            volume      = getattr(info, "last_volume", None)
-            market_cap  = getattr(info, "market_cap", None)
-            shares      = getattr(info, "shares", None)
-            year_high   = getattr(info, "year_high", None)
-            year_low    = getattr(info, "year_low", None)
-            exchange    = getattr(info, "exchange", "")
-
-            change    = (price - prev_close) if price and prev_close else None
-            change_pc = (change / prev_close * 100) if change and prev_close else None
+            t         = yf.Ticker(ticker)
+            fast      = t.fast_info
+            price     = getattr(fast, "last_price",     None)
+            prev      = getattr(fast, "previous_close", None)
+            day_high  = getattr(fast, "day_high",       None)
+            day_low   = getattr(fast, "day_low",        None)
+            volume    = getattr(fast, "last_volume",    None)
+            mkt_cap   = getattr(fast, "market_cap",     None)
+            yr_high   = getattr(fast, "year_high",      None)
+            yr_low    = getattr(fast, "year_low",       None)
+            exchange  = getattr(fast, "exchange",       "")
+            if price is None:
+                raise ValueError("No price data from yfinance")
+            change    = (price - prev) if price and prev else None
+            change_pc = (change / prev * 100) if change and prev else None
             direction = "▲" if (change or 0) >= 0 else "▼"
-
             lines = [
                 f"## {ticker}  —  Stock Quote",
                 f"Exchange:       {exchange}",
                 "",
-                f"Price:          ${price:.2f}"          if price     else "Price: N/A",
-                f"Change:         {direction} {abs(change):.2f}  "
-                f"({abs(change_pc):.2f}%)"               if change    else "Change: N/A",
+                f"Price:          ${price:.2f}",
+                (f"Change:         {direction} ${abs(change):.2f}  ({abs(change_pc):.2f}%)"
+                 if change else "Change:         N/A"),
                 "",
-                f"Open:           ${open_price:.2f}"     if open_price else "Open: N/A",
-                f"Day range:      ${day_low:.2f} – ${day_high:.2f}"
-                if day_low and day_high else "Day range: N/A",
-                f"52-week range:  ${year_low:.2f} – ${year_high:.2f}"
-                if year_low and year_high else "52-week range: N/A",
+                (f"Day range:      ${day_low:.2f} – ${day_high:.2f}"
+                 if day_low and day_high else "Day range:      N/A"),
+                (f"52-week range:  ${yr_low:.2f} – ${yr_high:.2f}"
+                 if yr_low and yr_high else "52-week range:  N/A"),
                 "",
                 f"Volume:         {_fmt_number(volume)}",
-                f"Market cap:     {_fmt_number(market_cap, prefix='$')}",
-                f"Shares out:     {_fmt_number(shares)}",
+                f"Market cap:     {_fmt_number(mkt_cap, prefix='$')}",
             ]
             return "\n".join(lines)
-
-        except Exception as exc:
-            logger.error("StockQuoteTool failed for %s: %s", ticker, exc)
-            return f"Could not fetch quote for '{ticker}': {exc}"
+        except Exception as yf_exc:
+            logger.warning("yfinance quote failed for %s (%s); LLM fallback.", ticker, yf_exc)
+        prompt = (
+            f"Provide a stock quote summary for the ticker {ticker}. "
+            "Include: approximate current price, recent daily change, "
+            "approximate market cap, 52-week high/low, exchange, "
+            "and a one-line business description. "
+            "Format with clearly labelled fields. "
+            "State clearly that figures are from training knowledge, not live data."
+        )
+        return _llm_fallback(prompt, f"{ticker} quote")
 
     async def _arun(self, **kwargs) -> str:
         raise NotImplementedError
@@ -235,18 +242,11 @@ class StockQuoteTool(BaseTool):
 # =============================================================================
 
 class CompanyInfoTool(BaseTool):
-    """
-    Fetch a comprehensive company profile for a ticker.
-
-    Returns: full name, sector, industry, description, employees,
-    headquarters, website, and key executives.
-    """
-
-    name: str = "company_info"
+    name: str        = "company_info"
     description: str = (
         "Get a company profile: business description, sector, industry, "
-        "headquarters, number of employees, and executives. "
-        "Use for: 'What does Apple do?', 'Tell me about Tesla as a company'."
+        "headquarters, employees, and key executives. "
+        "Use for: What does Apple do?, Tell me about Microsoft."
     )
     args_schema: Type[BaseModel] = TickerInput
 
@@ -255,24 +255,19 @@ class CompanyInfoTool(BaseTool):
         try:
             import yfinance as yf
             info = yf.Ticker(ticker).info
-
-            name        = _safe(info, "longName") or _safe(info, "shortName") or ticker
-            sector      = _safe(info, "sector",       "N/A")
-            industry    = _safe(info, "industry",     "N/A")
-            country     = _safe(info, "country",      "N/A")
-            city        = _safe(info, "city",         "")
+            if not info or len(info) < 5:
+                raise ValueError("yfinance returned empty info")
+            name        = _safe(info, "longName") or ticker
+            sector      = _safe(info, "sector",   "N/A")
+            industry    = _safe(info, "industry", "N/A")
+            country     = _safe(info, "country",  "N/A")
+            city        = _safe(info, "city",     "")
             employees   = _safe(info, "fullTimeEmployees")
-            website     = _safe(info, "website",      "N/A")
-            description = _safe(info, "longBusinessSummary", "No description available.")
-            currency    = _safe(info, "currency",     "USD")
-
-            # Top executives
-            officers = info.get("companyOfficers", [])[:3]
-            exec_lines = [
-                f"  • {o.get('name', '?')}  —  {o.get('title', '?')}"
-                for o in officers
-            ]
-
+            website     = _safe(info, "website",  "N/A")
+            description = _safe(info, "longBusinessSummary", "No description.")
+            officers    = info.get("companyOfficers", [])[:3]
+            exec_lines  = [f"  • {o.get('name','?')  }  —  {o.get('title','?')}"
+                           for o in officers]
             lines = [
                 f"## {name}  ({ticker})",
                 "",
@@ -281,19 +276,25 @@ class CompanyInfoTool(BaseTool):
                 f"Employees:   {_fmt_number(employees) if employees else 'N/A'}",
                 f"HQ:          {city + ', ' if city else ''}{country}",
                 f"Website:     {website}",
-                f"Currency:    {currency}",
                 "",
                 "### Business Summary",
                 description[:800] + ("…" if len(description) > 800 else ""),
-            ]
+                ]
             if exec_lines:
                 lines += ["", "### Key Executives"] + exec_lines
-
             return "\n".join(lines)
-
-        except Exception as exc:
-            logger.error("CompanyInfoTool failed for %s: %s", ticker, exc)
-            return f"Could not fetch company info for '{ticker}': {exc}"
+        except Exception as yf_exc:
+            logger.warning("yfinance info failed for %s (%s); LLM fallback.", ticker, yf_exc)
+        prompt = (
+            f"Provide a detailed company profile for the stock ticker {ticker}. "
+            "Include: full company name, sector, industry, country/HQ, "
+            "approximate employee count, website URL, "
+            "a 2–3 sentence business description, "
+            "and 2–3 key executives with their titles. "
+            "Format with clearly labelled sections. "
+            "State that this is from training knowledge, not live data."
+        )
+        return _llm_fallback(prompt, f"{ticker} company info")
 
     async def _arun(self, **kwargs) -> str:
         raise NotImplementedError
@@ -304,122 +305,93 @@ class CompanyInfoTool(BaseTool):
 # =============================================================================
 
 class FinancialStatementsTool(BaseTool):
-    """
-    Fetch income statement, balance sheet, or cash flow statement.
-
-    Returns the most recent 4 periods (annual or quarterly) with
-    the most important line items formatted for readability.
-    """
-
-    name: str = "financial_statements"
+    name: str        = "financial_statements"
     description: str = (
-        "Fetch financial statements for a company: income statement, "
-        "balance sheet, or cash flow statement. "
-        "Use for: 'Show me Apple's income statement', "
-        "'TSLA balance sheet quarterly', 'Amazon revenue last 4 years'."
+        "Fetch financial statements: income statement, balance sheet, or cash flow. "
+        "Use for: Apple income statement, TSLA balance sheet quarterly, "
+        "Amazon revenue last 4 years."
     )
     args_schema: Type[BaseModel] = StatementInput
 
-    _INCOME_KEYS = [
-        ("Total Revenue",           "Total Revenue"),
-        ("Gross Profit",            "Gross Profit"),
-        ("Operating Income",        "Operating Income"),
-        ("EBITDA",                  "EBITDA"),
-        ("Net Income",              "Net Income"),
-        ("Basic EPS",               "EPS (Basic)"),
-        ("Diluted EPS",             "EPS (Diluted)"),
-        ("Research And Development","R&D Expense"),
-        ("Selling General And Administrative", "SG&A"),
+    _INCOME_KEYS  = [
+        ("Total Revenue",                          "Total Revenue"),
+        ("Gross Profit",                           "Gross Profit"),
+        ("Operating Income",                       "Operating Income"),
+        ("EBITDA",                                 "EBITDA"),
+        ("Net Income",                             "Net Income"),
+        ("Basic EPS",                              "EPS (Basic)"),
+        ("Research And Development",               "R&D Expense"),
+        ("Selling General And Administrative",     "SG&A"),
     ]
     _BALANCE_KEYS = [
-        ("Total Assets",            "Total Assets"),
-        ("Total Liabilities Net Minority Interest", "Total Liabilities"),
-        ("Stockholders Equity",     "Shareholders' Equity"),
-        ("Cash And Cash Equivalents", "Cash & Equivalents"),
-        ("Total Debt",              "Total Debt"),
-        ("Current Assets",          "Current Assets"),
-        ("Current Liabilities",     "Current Liabilities"),
-        ("Inventory",               "Inventory"),
-        ("Accounts Receivable",     "Accounts Receivable"),
-        ("Retained Earnings",       "Retained Earnings"),
+        ("Total Assets",                           "Total Assets"),
+        ("Total Liabilities Net Minority Interest","Total Liabilities"),
+        ("Stockholders Equity",                    "Shareholders Equity"),
+        ("Cash And Cash Equivalents",              "Cash & Equivalents"),
+        ("Total Debt",                             "Total Debt"),
+        ("Current Assets",                        "Current Assets"),
+        ("Current Liabilities",                    "Current Liabilities"),
     ]
     _CASHFLOW_KEYS = [
-        ("Operating Cash Flow",     "Operating Cash Flow"),
-        ("Investing Cash Flow",     "Investing Cash Flow"),
-        ("Financing Cash Flow",     "Financing Cash Flow"),
-        ("Free Cash Flow",          "Free Cash Flow"),
-        ("Capital Expenditure",     "CapEx"),
-        ("Dividends Paid",          "Dividends Paid"),
-        ("Net Income",              "Net Income"),
+        ("Operating Cash Flow",                    "Operating Cash Flow"),
+        ("Investing Cash Flow",                    "Investing Cash Flow"),
+        ("Financing Cash Flow",                    "Financing Cash Flow"),
+        ("Free Cash Flow",                         "Free Cash Flow"),
+        ("Capital Expenditure",                    "CapEx"),
     ]
 
-    def _run(
-        self,
-        ticker: str,
-        statement: str = "income",
-        quarterly: bool = False,
-    ) -> str:
+    def _run(self, ticker: str, statement: str = "income", quarterly: bool = False) -> str:
         ticker = ticker.strip().upper()
         stmt   = statement.lower().strip()
-
         try:
             import yfinance as yf
-            import pandas as pd
-
             t    = yf.Ticker(ticker)
             freq = "Quarterly" if quarterly else "Annual"
-
             if stmt in ("income", "income_statement", "profit", "pl", "p&l"):
-                df        = t.quarterly_income_stmt if quarterly else t.income_stmt
-                title     = "Income Statement"
-                key_map   = self._INCOME_KEYS
+                df, title, key_map = (t.quarterly_income_stmt if quarterly else t.income_stmt), "Income Statement", self._INCOME_KEYS
             elif stmt in ("balance", "balance_sheet", "bs"):
-                df        = t.quarterly_balance_sheet if quarterly else t.balance_sheet
-                title     = "Balance Sheet"
-                key_map   = self._BALANCE_KEYS
+                df, title, key_map = (t.quarterly_balance_sheet if quarterly else t.balance_sheet), "Balance Sheet", self._BALANCE_KEYS
             elif stmt in ("cashflow", "cash_flow", "cf"):
-                df        = t.quarterly_cashflow if quarterly else t.cashflow
-                title     = "Cash Flow Statement"
-                key_map   = self._CASHFLOW_KEYS
+                df, title, key_map = (t.quarterly_cashflow if quarterly else t.cashflow), "Cash Flow Statement", self._CASHFLOW_KEYS
             else:
-                return (
-                    f"Unknown statement type '{statement}'. "
-                    "Use 'income', 'balance', or 'cashflow'."
-                )
-
+                return f"Unknown statement type '{statement}'. Use income, balance, or cashflow."
             if df is None or df.empty:
-                return f"No {title} data available for {ticker}."
-
-            # Take the most recent 4 periods, oldest-first for natural reading
-            df    = df.iloc[:, :4]
-            cols  = [c.strftime("%Y") if quarterly is False else c.strftime("%b %Y")
-                     for c in df.columns]
-
+                raise ValueError("empty dataframe")
+            df   = df.iloc[:, :4]
+            cols = [c.strftime("%Y") if not quarterly else c.strftime("%b %Y") for c in df.columns]
             lines = [
                 f"## {ticker}  —  {freq} {title}",
                 "",
                 f"{'Metric':<30}" + "".join(f"{c:>16}" for c in cols),
                 "─" * (30 + 16 * len(cols)),
-            ]
-
+                ]
             for raw_key, label in key_map:
                 if raw_key in df.index:
-                    row   = df.loc[raw_key]
+                    row = df.loc[raw_key]
                     cells = []
                     for v in row:
-                        try:
-                            cells.append(f"{float(v) / 1e9:>14.2f}B")
-                        except (TypeError, ValueError):
-                            cells.append(f"{'N/A':>16}")
+                        try:    cells.append(f"{float(v)/1e9:>14.2f}B")
+                        except: cells.append(f"{'N/A':>16}")
                     lines.append(f"{label:<30}" + "".join(cells))
-
-            lines.append("")
-            lines.append("Values in USD billions unless noted. Source: Yahoo Finance.")
+            lines += ["", "Values in USD billions. Source: Yahoo Finance."]
             return "\n".join(lines)
-
-        except Exception as exc:
-            logger.error("FinancialStatementsTool failed for %s: %s", ticker, exc)
-            return f"Could not fetch {statement} statement for '{ticker}': {exc}"
+        except Exception as yf_exc:
+            logger.warning("yfinance statements failed for %s (%s); LLM fallback.", ticker, yf_exc)
+        freq_str = "quarterly" if quarterly else "annual"
+        stmt_map = {
+            "income":   "income statement covering: revenue, gross profit, operating income, EBITDA, net income, EPS, R&D, SG&A",
+            "balance":  "balance sheet covering: total assets, total liabilities, equity, cash, total debt, current assets/liabilities",
+            "cashflow": "cash flow statement covering: operating, investing, financing cash flows, free cash flow, capex",
+        }
+        stmt_desc = stmt_map.get(stmt, stmt_map["income"])
+        prompt = (
+            f"Provide the {freq_str} {stmt_desc} for {ticker} "
+            "for the most recent 3–4 periods. "
+            "Format as a table with period columns and metric rows. "
+            "Express values in billions USD. "
+            "State clearly this is from training knowledge, not live filings."
+        )
+        return _llm_fallback(prompt, f"{ticker} {stmt} statement")
 
     async def _arun(self, **kwargs) -> str:
         raise NotImplementedError
@@ -430,20 +402,11 @@ class FinancialStatementsTool(BaseTool):
 # =============================================================================
 
 class FinancialRatiosTool(BaseTool):
-    """
-    Calculate and interpret key financial ratios for a company.
-
-    Covers valuation (P/E, P/B, P/S, EV/EBITDA), profitability (ROE, ROA,
-    margins), liquidity (current ratio), leverage (D/E), and dividends.
-    Each ratio is graded with a plain-English quality signal.
-    """
-
-    name: str = "financial_ratios"
+    name: str        = "financial_ratios"
     description: str = (
-        "Calculate valuation, profitability, liquidity, and leverage ratios. "
-        "Each ratio includes a qualitative grade. "
-        "Use for: 'Is Apple overvalued?', 'MSFT profitability ratios', "
-        "'Compare P/E of Tesla vs industry'."
+        "Calculate key financial ratios with qualitative grades: "
+        "P/E, P/B, ROE, ROA, margins, debt/equity, dividend yield. "
+        "Use for: Is Apple overvalued?, MSFT profitability metrics."
     )
     args_schema: Type[BaseModel] = TickerInput
 
@@ -452,86 +415,84 @@ class FinancialRatiosTool(BaseTool):
         try:
             import yfinance as yf
             info = yf.Ticker(ticker).info
-
-            name = _safe(info, "longName") or ticker
-
-            # ── Valuation ──────────────────────────────────────────────────
+            if not info or len(info) < 5:
+                raise ValueError("insufficient info from yfinance")
+            name        = _safe(info, "longName") or ticker
             pe          = _safe(info, "trailingPE")
-            forward_pe  = _safe(info, "forwardPE")
+            fwd_pe      = _safe(info, "forwardPE")
             pb          = _safe(info, "priceToBook")
             ps          = _safe(info, "priceToSalesTrailing12Months")
             ev_ebitda   = _safe(info, "enterpriseToEbitda")
             peg         = _safe(info, "pegRatio")
-
-            # ── Profitability ──────────────────────────────────────────────
-            gross_margin  = _safe(info, "grossMargins")
-            oper_margin   = _safe(info, "operatingMargins")
-            profit_margin = _safe(info, "profitMargins")
-            roe           = _safe(info, "returnOnEquity")
-            roa           = _safe(info, "returnOnAssets")
-            revenue_growth= _safe(info, "revenueGrowth")
-            earnings_growth= _safe(info, "earningsGrowth")
-
-            # ── Liquidity ──────────────────────────────────────────────────
-            current_ratio = _safe(info, "currentRatio")
-            quick_ratio   = _safe(info, "quickRatio")
-
-            # ── Leverage ───────────────────────────────────────────────────
-            de_ratio      = _safe(info, "debtToEquity")
-            total_debt    = _safe(info, "totalDebt")
-            fcf           = _safe(info, "freeCashflow")
-
-            # ── Dividends ──────────────────────────────────────────────────
-            div_yield     = _safe(info, "dividendYield")
-            div_rate      = _safe(info, "dividendRate")
-            payout        = _safe(info, "payoutRatio")
-            ex_date       = _safe(info, "exDividendDate")
-
+            gross_m     = _safe(info, "grossMargins")
+            oper_m      = _safe(info, "operatingMargins")
+            net_m       = _safe(info, "profitMargins")
+            roe         = _safe(info, "returnOnEquity")
+            roa         = _safe(info, "returnOnAssets")
+            rev_gr      = _safe(info, "revenueGrowth")
+            earn_gr     = _safe(info, "earningsGrowth")
+            cur_ratio   = _safe(info, "currentRatio")
+            quick       = _safe(info, "quickRatio")
+            de          = _safe(info, "debtToEquity")
+            tot_debt    = _safe(info, "totalDebt")
+            fcf         = _safe(info, "freeCashflow")
+            div_yield   = _safe(info, "dividendYield")
+            div_rate    = _safe(info, "dividendRate")
+            payout      = _safe(info, "payoutRatio")
             lines = [
                 f"## {name}  ({ticker})  —  Financial Ratios",
                 "",
                 "### Valuation",
                 f"  P/E  (trailing):   {_fmt_ratio(pe)}{_grade_ratio('pe', pe)}",
-                f"  P/E  (forward):    {_fmt_ratio(forward_pe)}{_grade_ratio('pe', forward_pe)}",
+                f"  P/E  (forward):    {_fmt_ratio(fwd_pe)}{_grade_ratio('pe', fwd_pe)}",
                 f"  P/B:               {_fmt_ratio(pb)}{_grade_ratio('pb', pb)}",
                 f"  P/S:               {_fmt_ratio(ps)}",
                 f"  EV/EBITDA:         {_fmt_ratio(ev_ebitda)}",
                 f"  PEG ratio:         {_fmt_ratio(peg)}",
                 "",
                 "### Profitability",
-                f"  Gross margin:      {_fmt_pct(gross_margin)}",
-                f"  Operating margin:  {_fmt_pct(oper_margin)}",
-                f"  Net margin:        {_fmt_pct(profit_margin)}",
+                f"  Gross margin:      {_fmt_pct(gross_m)}",
+                f"  Operating margin:  {_fmt_pct(oper_m)}",
+                f"  Net margin:        {_fmt_pct(net_m)}",
                 f"  Return on Equity:  {_fmt_pct(roe)}{_grade_ratio('roe', roe)}",
                 f"  Return on Assets:  {_fmt_pct(roa)}{_grade_ratio('roa', roa)}",
-                f"  Revenue growth:    {_fmt_pct(revenue_growth)}",
-                f"  Earnings growth:   {_fmt_pct(earnings_growth)}",
+                f"  Revenue growth:    {_fmt_pct(rev_gr)}",
+                f"  Earnings growth:   {_fmt_pct(earn_gr)}",
                 "",
                 "### Liquidity",
-                f"  Current ratio:     {_fmt_ratio(current_ratio)}{_grade_ratio('current', current_ratio)}",
-                f"  Quick ratio:       {_fmt_ratio(quick_ratio)}",
+                f"  Current ratio:     {_fmt_ratio(cur_ratio)}{_grade_ratio('current', cur_ratio)}",
+                f"  Quick ratio:       {_fmt_ratio(quick)}",
                 "",
                 "### Leverage",
-                f"  Debt / Equity:     {_fmt_ratio(de_ratio)}{_grade_ratio('de', de_ratio)}",
-                f"  Total debt:        {_fmt_number(total_debt, prefix='$')}",
+                f"  Debt / Equity:     {_fmt_ratio(de)}{_grade_ratio('de', de)}",
+                f"  Total debt:        {_fmt_number(tot_debt, prefix='$')}",
                 f"  Free cash flow:    {_fmt_number(fcf, prefix='$')}",
             ]
-
             if div_yield or div_rate:
                 lines += [
                     "",
                     "### Dividends",
-                    f"  Annual yield:      {_fmt_pct(div_yield)}",
-                    f"  Annual rate:       {_fmt_number(div_rate, prefix='$')} per share",
-                    f"  Payout ratio:      {_fmt_pct(payout)}",
+                    f"  Annual yield:  {_fmt_pct(div_yield)}",
+                    f"  Annual rate:   {_fmt_number(div_rate, prefix='$')} per share",
+                    f"  Payout ratio:  {_fmt_pct(payout)}",
                 ]
-
             lines += ["", "Source: Yahoo Finance. Grades are qualitative guides only."]
             return "\n".join(lines)
-
-        except Exception as exc:
-            logger.error("FinancialRatiosTool failed for %s: %s", ticker, exc)
-            return f"Could not calculate ratios for '{ticker}': {exc}"
+        except Exception as yf_exc:
+            logger.warning("yfinance ratios failed for %s (%s); LLM fallback.", ticker, yf_exc)
+        prompt = (
+            f"Provide key financial ratios for the stock {ticker} with commentary. Include:\n"
+            "Valuation: P/E (trailing and forward), P/B, P/S, EV/EBITDA, PEG\n"
+            "Profitability: gross margin, operating margin, net margin, ROE, ROA, "
+            "revenue growth, earnings growth\n"
+            "Liquidity: current ratio, quick ratio\n"
+            "Leverage: debt/equity, total debt, free cash flow\n"
+            "Dividends: yield and payout ratio (if applicable)\n"
+            "For each section add a brief qualitative comment comparing to industry norms.\n"
+            "Format with clearly labelled sections. "
+            "State this is from training knowledge, not live data."
+        )
+        return _llm_fallback(prompt, f"{ticker} ratios")
 
     async def _arun(self, **kwargs) -> str:
         raise NotImplementedError
@@ -542,103 +503,76 @@ class FinancialRatiosTool(BaseTool):
 # =============================================================================
 
 class PriceHistoryTool(BaseTool):
-    """
-    Fetch historical OHLCV price data and compute derived statistics.
-
-    Returns: first/last price, total return, annualised return (CAGR),
-    volatility (annualised std dev), max drawdown, and a condensed
-    table of recent closing prices.
-    """
-
-    name: str = "price_history"
+    name: str        = "price_history"
     description: str = (
-        "Fetch historical price data and performance statistics for a ticker. "
-        "Returns total return, CAGR, annualised volatility, and max drawdown. "
-        "Use for: 'AAPL performance last 5 years', "
-        "'How has MSFT stock done since 2020?', 'BTC-USD 6 month history'."
+        "Fetch historical price data and performance statistics: "
+        "total return, CAGR, volatility, max drawdown, recent prices. "
+        "Use for: AAPL performance last 5 years, How has MSFT done since 2020?"
     )
     args_schema: Type[BaseModel] = TickerPeriodInput
 
-    def _run(
-        self,
-        ticker:   str,
-        period:   str = "1y",
-        interval: str = "1d",
-    ) -> str:
+    def _run(self, ticker: str, period: str = "1y", interval: str = "1d") -> str:
         ticker = ticker.strip().upper()
         try:
-            import yfinance as yf
-            import math
-
+            import yfinance as yf, math
             hist = yf.Ticker(ticker).history(period=period, interval=interval)
-
-            if hist.empty:
-                return (
-                    f"No price history found for '{ticker}' "
-                    f"(period={period}, interval={interval})."
-                )
-
+            if hist is None or hist.empty:
+                raise ValueError("empty history")
             close      = hist["Close"]
             first_px   = float(close.iloc[0])
             last_px    = float(close.iloc[-1])
-            n_periods  = len(close)
+            n          = len(close)
             start_date = hist.index[0].strftime("%Y-%m-%d")
             end_date   = hist.index[-1].strftime("%Y-%m-%d")
-
-            # Total and annualised return
             total_ret  = (last_px - first_px) / first_px
-            years      = n_periods / 252 if interval == "1d" else n_periods / 52
-            cagr       = ((1 + total_ret) ** (1 / max(years, 0.01))) - 1 if years else None
-
-            # Annualised volatility (std dev of daily log returns × √252)
-            log_returns = close.pct_change().dropna()
-            ann_vol     = float(log_returns.std() * math.sqrt(252)) if interval == "1d" else None
-
-            # Maximum drawdown
-            rolling_max = close.cummax()
-            drawdowns   = (close - rolling_max) / rolling_max
-            max_dd      = float(drawdowns.min())
-
-            # Recent price table (last 10 data points)
-            recent      = hist.tail(10)[["Open", "High", "Low", "Close", "Volume"]]
-            table_lines = [
-                f"{'Date':<12} {'Open':>8} {'High':>8} {'Low':>8} {'Close':>8} {'Volume':>12}",
-                "─" * 60,
-            ]
+            years      = n / 252 if interval == "1d" else n / 52
+            cagr       = ((1 + total_ret) ** (1 / max(years, 0.01))) - 1
+            ann_vol    = float(close.pct_change().dropna().std() * math.sqrt(252)) if interval=="1d" else None
+            max_dd     = float(((close - close.cummax()) / close.cummax()).min())
+            direction  = "▲" if total_ret >= 0 else "▼"
+            recent     = hist.tail(8)[["Open","High","Low","Close","Volume"]]
+            table = [f"{'Date':<12} {'Open':>8} {'High':>8} {'Low':>8} {'Close':>8} {'Volume':>12}",
+                     "─" * 60]
             for ts, row in recent.iterrows():
-                date_str = ts.strftime("%Y-%m-%d")
-                table_lines.append(
-                    f"{date_str:<12} "
-                    f"${row['Open']:>7.2f} "
-                    f"${row['High']:>7.2f} "
-                    f"${row['Low']:>7.2f} "
-                    f"${row['Close']:>7.2f} "
+                table.append(
+                    f"{ts.strftime('%Y-%m-%d'):<12} "
+                    f"${row['Open']:>7.2f} ${row['High']:>7.2f} "
+                    f"${row['Low']:>7.2f} ${row['Close']:>7.2f} "
                     f"{_fmt_number(row['Volume']):>12}"
                 )
-
-            direction = "▲" if total_ret >= 0 else "▼"
-
             lines = [
                 f"## {ticker}  —  Price History  ({period}, {interval})",
-                f"Period:             {start_date}  →  {end_date}  ({n_periods} bars)",
+                f"Period: {start_date} → {end_date}  ({n} bars)",
                 "",
-                f"Start price:        ${first_px:.2f}",
-                f"End price:          ${last_px:.2f}",
-                f"Total return:       {direction} {abs(total_ret) * 100:.2f}%",
+                f"Start price:    ${first_px:.2f}",
+                f"End price:      ${last_px:.2f}",
+                f"Total return:   {direction} {abs(total_ret) * 100:.2f}%",
+                f"CAGR:           {cagr * 100:.2f}%",
             ]
-            if cagr is not None:
-                lines.append(f"CAGR:               {cagr * 100:.2f}%")
-            if ann_vol is not None:
-                lines.append(f"Annualised vol:     {ann_vol * 100:.2f}%")
-            lines.append(f"Max drawdown:       {max_dd * 100:.2f}%")
-            lines.append(f"High (period):      ${float(hist['High'].max()):.2f}")
-            lines.append(f"Low  (period):      ${float(hist['Low'].min()):.2f}")
-            lines += ["", "### Recent Prices"] + table_lines
+            if ann_vol:
+                lines.append(f"Ann. volatility:{ann_vol * 100:.2f}%")
+            lines.append(f"Max drawdown:   {max_dd * 100:.2f}%")
+            lines.append(f"Period high:    ${float(hist['High'].max()):.2f}")
+            lines.append(f"Period low:     ${float(hist['Low'].min()):.2f}")
+            lines += ["", "### Recent Prices"] + table
             return "\n".join(lines)
-
-        except Exception as exc:
-            logger.error("PriceHistoryTool failed for %s: %s", ticker, exc)
-            return f"Could not fetch price history for '{ticker}': {exc}"
+        except Exception as yf_exc:
+            logger.warning("yfinance history failed for %s (%s); LLM fallback.", ticker, yf_exc)
+        period_text = {
+            "1d":"the past day","5d":"the past 5 days","1mo":"the past month",
+            "3mo":"the past 3 months","6mo":"the past 6 months","1y":"the past year",
+            "2y":"the past 2 years","5y":"the past 5 years","10y":"the past 10 years",
+            "ytd":"year-to-date","max":"all time",
+        }.get(period, period)
+        prompt = (
+            f"Provide a stock price performance summary for {ticker} over {period_text}. "
+            "Include: approximate start and end prices, total return percentage, "
+            "CAGR (if multi-year), approximate annualised volatility, "
+            "estimated max drawdown, and period high/low. "
+            "Also write 2–3 sentences on the key drivers of performance. "
+            "State clearly this is from training knowledge, not live price data."
+        )
+        return _llm_fallback(prompt, f"{ticker} history {period}")
 
     async def _arun(self, **kwargs) -> str:
         raise NotImplementedError
@@ -649,89 +583,94 @@ class PriceHistoryTool(BaseTool):
 # =============================================================================
 
 class StockComparisonTool(BaseTool):
-    """
-    Compare up to 5 tickers side-by-side on key financial metrics.
-
-    Returns a formatted table covering price, market cap, P/E, P/B,
-    revenue, net income, gross margin, ROE, dividend yield, and beta.
-    """
-
-    name: str = "stock_comparison"
+    name: str        = "stock_comparison"
     description: str = (
-        "Compare multiple stocks side-by-side on price, valuation, "
+        "Compare up to 5 stocks side-by-side on price, valuation, "
         "profitability, and dividend metrics. "
-        "Use for: 'Compare AAPL vs MSFT', 'FAANG stock comparison', "
-        "'Which is cheaper: TSLA or GM?'"
+        "Use for: Compare AAPL vs MSFT, FAANG comparison."
     )
     args_schema: Type[BaseModel] = CompareInput
 
-    _METRICS: list[tuple[str, str, callable]] = [
-        ("Price",            "currentPrice",                  lambda v: f"${v:.2f}"),
-        ("Market Cap",       "marketCap",                     lambda v: _fmt_number(v, "$")),
-        ("P/E (trailing)",   "trailingPE",                    lambda v: f"{v:.1f}x"),
-        ("P/E (forward)",    "forwardPE",                     lambda v: f"{v:.1f}x"),
-        ("P/B",              "priceToBook",                   lambda v: f"{v:.2f}x"),
-        ("Revenue (TTM)",    "totalRevenue",                  lambda v: _fmt_number(v, "$")),
-        ("Net Income (TTM)", "netIncomeToCommon",             lambda v: _fmt_number(v, "$")),
-        ("Gross Margin",     "grossMargins",                  lambda v: _fmt_pct(v)),
-        ("Net Margin",       "profitMargins",                 lambda v: _fmt_pct(v)),
-        ("ROE",              "returnOnEquity",                lambda v: _fmt_pct(v)),
-        ("Debt/Equity",      "debtToEquity",                  lambda v: f"{v:.2f}x"),
-        ("Dividend Yield",   "dividendYield",                 lambda v: _fmt_pct(v)),
-        ("Beta",             "beta",                          lambda v: f"{v:.2f}"),
-        ("52-wk Return",     "52WeekChange",                  lambda v: _fmt_pct(v)),
+    _METRICS = [
+        ("Price",          "currentPrice"),
+        ("Market Cap",     "marketCap"),
+        ("P/E (trailing)", "trailingPE"),
+        ("P/E (forward)",  "forwardPE"),
+        ("P/B",            "priceToBook"),
+        ("Revenue (TTM)",  "totalRevenue"),
+        ("Net Income",     "netIncomeToCommon"),
+        ("Gross Margin",   "grossMargins"),
+        ("Net Margin",     "profitMargins"),
+        ("ROE",            "returnOnEquity"),
+        ("Debt/Equity",    "debtToEquity"),
+        ("Div. Yield",     "dividendYield"),
+        ("Beta",           "beta"),
+        ("52-wk Return",   "52WeekChange"),
     ]
+
+    def _fmt_cell(self, key: str, value) -> str:
+        if value is None:
+            return "N/A"
+        try:
+            v = float(value)
+            if key == "currentPrice":      return f"${v:.2f}"
+            if key in ("marketCap","totalRevenue","netIncomeToCommon"):
+                return _fmt_number(v, "$")
+            if key in ("grossMargins","profitMargins","returnOnEquity",
+                       "dividendYield","52WeekChange"):
+                return _fmt_pct(v)
+            if key in ("trailingPE","forwardPE","priceToBook","debtToEquity"):
+                return f"{v:.2f}x"
+            return f"{v:.2f}"
+        except (TypeError, ValueError):
+            return "N/A"
 
     def _run(self, tickers: str) -> str:
         ticker_list = [t.strip().upper() for t in tickers.split(",")][:5]
         if len(ticker_list) < 2:
             return "Please provide at least 2 tickers separated by commas."
-
         try:
             import yfinance as yf
-
-            infos: dict[str, dict] = {}
+            infos = {}
+            failures = 0
             for sym in ticker_list:
                 try:
-                    infos[sym] = yf.Ticker(sym).info
-                except Exception as exc:
-                    logger.warning("Could not fetch %s: %s", sym, exc)
+                    info = yf.Ticker(sym).info
+                    infos[sym] = info if info and len(info) > 5 else {}
+                    if not infos[sym]:
+                        failures += 1
+                except Exception:
                     infos[sym] = {}
-
-            # Column widths
-            col_w     = max(12, max(len(t) for t in ticker_list) + 2)
-            label_w   = 20
-            header    = f"{'Metric':<{label_w}}" + "".join(
-                f"{sym:>{col_w}}" for sym in ticker_list
-            )
-            separator = "─" * (label_w + col_w * len(ticker_list))
-
+                    failures += 1
+            if failures == len(ticker_list):
+                raise ValueError("yfinance failed for all tickers")
+            col_w   = max(12, max(len(t) for t in ticker_list) + 2)
+            label_w = 18
             rows = [
                 f"## Stock Comparison: {' vs '.join(ticker_list)}",
                 "",
-                header,
-                separator,
-            ]
-
-            for label, key, fmt in self._METRICS:
-                cells = []
-                for sym in ticker_list:
-                    v = _safe(infos.get(sym, {}), key)
-                    try:
-                        cells.append(fmt(v) if v is not None else "N/A")
-                    except Exception:
-                        cells.append("N/A")
-                row = f"{label:<{label_w}}" + "".join(
-                    f"{c:>{col_w}}" for c in cells
-                )
-                rows.append(row)
-
+                f"{'Metric':<{label_w}}" + "".join(f"{s:>{col_w}}" for s in ticker_list),
+                "─" * (label_w + col_w * len(ticker_list)),
+                ]
+            for label, key in self._METRICS:
+                cells = [self._fmt_cell(key, _safe(infos.get(s, {}), key))
+                         for s in ticker_list]
+                rows.append(f"{label:<{label_w}}" + "".join(f"{c:>{col_w}}" for c in cells))
             rows += ["", "Source: Yahoo Finance. N/A = data unavailable."]
             return "\n".join(rows)
-
-        except Exception as exc:
-            logger.error("StockComparisonTool failed: %s", exc)
-            return f"Could not compare tickers: {exc}"
+        except Exception as yf_exc:
+            logger.warning("yfinance comparison failed (%s); LLM fallback.", yf_exc)
+        prompt = (
+            f"Compare these stocks side by side: {', '.join(ticker_list)}.\n"
+            "Provide a markdown comparison table with these metrics per company:\n"
+            "current price, market cap, P/E (trailing), P/B, revenue (TTM), "
+            "net income, gross margin, net margin, ROE, debt/equity, "
+            "dividend yield, beta.\n"
+            "After the table, write 2–3 sentences on which company looks strongest "
+            "on valuation vs profitability.\n"
+            "State clearly this is from training knowledge, not live data."
+        )
+        return _llm_fallback(prompt, f"comparison: {','.join(ticker_list)}")
 
     async def _arun(self, **kwargs) -> str:
         raise NotImplementedError
@@ -742,7 +681,7 @@ class StockComparisonTool(BaseTool):
 # =============================================================================
 
 def get_financial_tools() -> list[BaseTool]:
-    """Return all financial analysis tools."""
+    """Return all six financial analysis tools."""
     return [
         StockQuoteTool(),
         CompanyInfoTool(),

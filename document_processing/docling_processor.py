@@ -1,20 +1,41 @@
 """
 document_processing/docling_processor.py
 ──────────────────────────────────────────
-Wraps Docling to convert documents (PDF, DOCX, XLSX, PPTX) into structured
-text chunks with rich metadata for vector-store ingestion.
+Converts documents (PDF, DOCX, XLSX, PPTX) into structured text chunks
+ready for vector-store ingestion.
 
-Each ``DocumentChunk`` carries:
-  • The text content
-  • Source document path & friendly title
-  • Page / slide / sheet reference
-  • Section heading path (breadcrumb)
-  • Unique chunk ID for deep-linking back to the source
+Processing pipeline (per file)
+───────────────────────────────
+  Stage 1 — Parse → Markdown
+    Docling converts the source file to a clean Markdown string that
+    preserves headings, lists, tables (GFM pipe-table format), and code
+    blocks.  This gives the embedder a semantically rich, structured view.
+
+    When Docling is unavailable, lightweight pure-Python renderers produce
+    an equivalent Markdown string:
+        DOCX  →  python-docx  (heading styles → # / ## / ###)
+        XLSX  →  openpyxl     (sheets → ## heading + pipe-tables)
+        PPTX  →  python-pptx  (slides → ## Slide N + paragraphs)
+        PDF   →  pypdf         (pages  → ## Page N + plain text)
+
+  Stage 2 — UTF-8 normalisation  (``to_utf8``)
+    • Decodes bytes to str (auto-detects encoding, errors→replacement char).
+    • Round-trips through UTF-8 to flush lone surrogate code points.
+    • Applies NFKC normalisation (ligatures, fullwidth digits, etc.).
+    • Strips null bytes and C0/C1 control characters that break tokenisers.
+
+  Stage 3 — Chunk with heading context
+    The normalised Markdown is parsed line by line to track the active
+    heading breadcrumb (# / ## / ###).  Content between headings is split
+    into overlapping windows using chunk_size / chunk_overlap.  Every chunk
+    carries its section_path so retrieval can surface provenance.
 """
 from __future__ import annotations
 
 import hashlib
 import logging
+import re
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
@@ -25,44 +46,98 @@ logger = logging.getLogger(__name__)
 
 SUPPORTED_SUFFIXES = {".pdf", ".docx", ".xlsx", ".xls", ".pptx", ".ppt"}
 
+_HEADING_RE  = re.compile(r"^(#{1,6})\s+(.*)")
+_PAGE_RE     = re.compile(r"^#{1,2}\s+(?:Page|Slide)\s+(\d+)", re.IGNORECASE)
+_CONTROL_RE  = re.compile(r"[\x01-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Data model
-# ─────────────────────────────────────────────────────────────────────────────
+
+# =============================================================================
+#  UTF-8 normalisation
+# =============================================================================
+
+def to_utf8(
+        text: "str | bytes",
+        source_encoding: str = "utf-8",
+        normalisation_form: str = "NFKC",
+) -> str:
+    """
+    Return a clean, normalised UTF-8 string.
+
+    Steps
+    -----
+    1. Decode ``bytes`` → ``str`` using ``source_encoding``
+       (``errors="replace"`` so no byte is silently dropped).
+    2. Round-trip through UTF-8 to flush lone surrogate code points.
+    3. Apply Unicode normalisation (default NFKC):
+       ﬁ→fi, １→1, ™→TM, etc.
+    4. Strip null bytes and C0/C1 control characters
+       (keeps \\t, \\n, \\r).
+
+    Parameters
+    ----------
+    text              : Input str or bytes.
+    source_encoding   : Codec used when *text* is bytes.
+    normalisation_form: Unicode form — NFC | NFKC | NFD | NFKD.
+
+    Returns
+    -------
+    str  Clean UTF-8 string safe for embedding models.
+    """
+    if isinstance(text, bytes):
+        text = text.decode(source_encoding, errors="replace")
+
+    # Flush lone surrogates that Python str can hold but UTF-8 cannot encode
+    text = text.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
+
+    # Canonical / compatibility decomposition + recomposition
+    text = unicodedata.normalize(normalisation_form, text)
+
+    # Replace control chars (except \t \n \r) with a space
+    text = _CONTROL_RE.sub(" ", text)
+
+    # Remove null bytes
+    text = text.replace("\x00", "")
+
+    return text
+
+
+# =============================================================================
+#  DocumentChunk
+# =============================================================================
 
 @dataclass
 class DocumentChunk:
     """
-    A single text chunk extracted from a document.
+    A single Markdown text chunk extracted from a document.
 
-    Attributes:
-        chunk_id:       Stable SHA-256 derived from source + page + offset.
-        text:           The chunk's textual content.
-        doc_path:       Absolute path to the source document.
-        doc_title:      Human-readable document name.
-        page_number:    1-based page/slide/sheet number (None if unavailable).
-        section_path:   Breadcrumb of heading levels, e.g. ["Chapter 1", "Intro"].
-        char_offset:    Character offset within the page/element (for ordering).
-        metadata:       Extra key-value metadata (doctype, etc.).
+    All ``text`` content is guaranteed to be valid UTF-8 Markdown.
+
+    Attributes
+    ----------
+    chunk_id      : SHA-256 derived ID (source path + page + offset).
+    text          : UTF-8 Markdown content for this chunk.
+    doc_path      : Absolute path to the source document.
+    doc_title     : Human-readable document name.
+    page_number   : 1-based page / slide / sheet number (None if unknown).
+    section_path  : Heading breadcrumb, e.g. ["Chapter 1", "Introduction"].
+    char_offset   : Character offset within the document (ordering key).
+    metadata      : Arbitrary extra metadata.
+                    ``markdown_source=True`` is always set so consumers know
+                    the text is Markdown-formatted.
     """
 
-    chunk_id: str
-    text: str
-    doc_path: str
-    doc_title: str
-    page_number: Optional[int] = None
-    section_path: list[str] = field(default_factory=list)
-    char_offset: int = 0
-    metadata: dict = field(default_factory=dict)
-
-    # ── Helpers ──────────────────────────────────────────────────────────────
+    chunk_id:     str
+    text:         str
+    doc_path:     str
+    doc_title:    str
+    page_number:  Optional[int] = None
+    section_path: list[str]     = field(default_factory=list)
+    char_offset:  int           = 0
+    metadata:     dict          = field(default_factory=dict)
 
     @property
     def reference(self) -> str:
-        """
-        Short human-readable reference, e.g.:
-            "Q3_Report.pdf › Page 4 › Revenue Analysis"
-        """
+        """'Q3_Report › Page 4 › Revenue Analysis'."""
         parts = [self.doc_title]
         if self.page_number:
             parts.append(f"Page {self.page_number}")
@@ -73,42 +148,46 @@ class DocumentChunk:
     def to_langchain_doc(self):
         """Convert to a LangChain Document for vector-store ingestion."""
         from langchain_core.documents import Document
-
         return Document(
             page_content=self.text,
             metadata={
-                "chunk_id": self.chunk_id,
-                "doc_path": self.doc_path,
-                "doc_title": self.doc_title,
-                "page_number": self.page_number,
+                "chunk_id":     self.chunk_id,
+                "doc_path":     self.doc_path,
+                "doc_title":    self.doc_title,
+                "page_number":  self.page_number,
                 "section_path": " › ".join(self.section_path),
-                "reference": self.reference,
+                "reference":    self.reference,
                 **self.metadata,
             },
         )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Docling processor
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+#  DoclingProcessor
+# =============================================================================
 
 class DoclingProcessor:
     """
-    Uses Docling to parse documents and yields ``DocumentChunk`` objects.
+    Convert documents to UTF-8 Markdown chunks.
 
-    Docling handles the heavy lifting of OCR, table extraction, and heading
-    detection for all supported file types.
+    Per-file pipeline
+    -----------------
+    1. ``_to_markdown(path)``      Docling or fallback renderer → raw Markdown
+    2. ``to_utf8(markdown)``       Normalise encoding + strip control chars
+    3. ``_split_with_headings()``  Track heading context; emit DocumentChunks
     """
 
     def __init__(
-        self,
-        chunk_size: int = settings.chunk_size,
-        chunk_overlap: int = settings.chunk_overlap,
+            self,
+            chunk_size:    int = settings.chunk_size,
+            chunk_overlap: int = settings.chunk_overlap,
     ) -> None:
-        self.chunk_size = chunk_size
+        self.chunk_size    = chunk_size
         self.chunk_overlap = chunk_overlap
 
-    # ── Internal helpers ────────────────────────────────────────────────────
+    # -------------------------------------------------------------------------
+    #  Helpers
+    # -------------------------------------------------------------------------
 
     @staticmethod
     def _make_chunk_id(doc_path: str, page: Optional[int], offset: int) -> str:
@@ -116,7 +195,7 @@ class DoclingProcessor:
         return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
     def _split_text(self, text: str) -> list[str]:
-        """Naive overlapping-window splitter (no external dependency)."""
+        """Overlapping sliding-window splitter."""
         chunks: list[str] = []
         step = max(1, self.chunk_size - self.chunk_overlap)
         for start in range(0, len(text), step):
@@ -125,222 +204,256 @@ class DoclingProcessor:
                 chunks.append(chunk)
         return chunks
 
-    # ── Docling-specific parsing ─────────────────────────────────────────────
+    # -------------------------------------------------------------------------
+    #  Stage 1 — Parse → Markdown
+    # -------------------------------------------------------------------------
 
-    def _parse_with_docling(self, path: Path) -> list[DocumentChunk]:
+    def _to_markdown(self, path: Path) -> str:
         """
-        Primary parsing path: use Docling's DocumentConverter.
-        Returns a list of DocumentChunk objects.
+        Convert *path* to a Markdown string.
+
+        Tries Docling first (best quality — OCR, tables, heading detection).
+        Falls back to pure-Python renderers when Docling is absent or fails.
+        """
+        try:
+            return self._docling_to_markdown(path)
+        except ImportError:
+            logger.warning(
+                "Docling not available — using fallback Markdown renderer for '%s'.",
+                path.name,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Docling failed for '%s' (%s) — using fallback renderer.",
+                path.name, exc,
+            )
+        return self._fallback_to_markdown(path)
+
+    def _docling_to_markdown(self, path: Path) -> str:
+        """
+        Use Docling's DocumentConverter to produce Markdown.
+
+        Docling's ``export_to_markdown()`` preserves:
+          • Headings (# / ## / ###)
+          • Paragraphs and lists
+          • Tables (GFM pipe-table format)
+          • Code blocks (fenced with ```)
+          • Captions and footnotes
         """
         try:
             from docling.document_converter import DocumentConverter  # type: ignore
-            from docling.datamodel.base_models import InputFormat  # type: ignore
         except ImportError as exc:
             raise ImportError(
-                "docling is not installed. Run: pip install docling"
+                "docling is not installed.  Run: pip install docling"
             ) from exc
 
         converter = DocumentConverter()
-        result = converter.convert(str(path))
-        doc = result.document
+        result    = converter.convert(str(path))
+        markdown  = result.document.export_to_markdown()
+        logger.debug(
+            "Docling→Markdown: '%s' → %d chars.", path.name, len(markdown)
+        )
+        return markdown
 
-        doc_title = path.stem.replace("_", " ").replace("-", " ").title()
-        doc_path_str = str(path.resolve())
-
-        chunks: list[DocumentChunk] = []
-        current_headings: list[str] = []
-
-        # Iterate over Docling's document body items
-        for item in doc.iterate_items():
-            label = getattr(item, "label", "")
-            text_content = ""
-
-            # Extract text from the item
-            if hasattr(item, "text"):
-                text_content = str(item.text).strip()
-            elif hasattr(item, "export_to_markdown"):
-                text_content = item.export_to_markdown().strip()
-
-            if not text_content:
-                continue
-
-            # Track heading hierarchy for section breadcrumbs
-            if "heading" in str(label).lower() or "title" in str(label).lower():
-                level = 1
-                for lvl_name in ["heading1", "heading2", "heading3"]:
-                    if lvl_name in str(label).lower():
-                        level = int(lvl_name[-1])
-                        break
-                current_headings = current_headings[: level - 1]
-                current_headings.append(text_content[:80])
-
-            # Get page reference if available
-            page_num: Optional[int] = None
-            if hasattr(item, "prov") and item.prov:
-                prov = item.prov[0] if isinstance(item.prov, list) else item.prov
-                if hasattr(prov, "page_no"):
-                    page_num = prov.page_no
-
-            # Split long text into overlapping chunks
-            for offset, sub_text in enumerate(self._split_text(text_content)):
-                chunk_id = self._make_chunk_id(doc_path_str, page_num, offset)
-                chunks.append(
-                    DocumentChunk(
-                        chunk_id=chunk_id,
-                        text=sub_text,
-                        doc_path=doc_path_str,
-                        doc_title=doc_title,
-                        page_number=page_num,
-                        section_path=list(current_headings),
-                        char_offset=offset * max(1, self.chunk_size - self.chunk_overlap),
-                        metadata={"doctype": path.suffix.lstrip("."), "label": str(label)},
-                    )
-                )
-
-        logger.info("Docling parsed '%s' → %d chunks.", path.name, len(chunks))
-        return chunks
-
-    # ── Fallback parsers ─────────────────────────────────────────────────────
-
-    def _parse_fallback(self, path: Path) -> list[DocumentChunk]:
-        """
-        Pure-Python fallback parsers for when Docling is unavailable.
-        Supports DOCX, XLSX, PPTX via python-docx / openpyxl / python-pptx.
-        """
+    def _fallback_to_markdown(self, path: Path) -> str:
+        """Dispatch to the correct pure-Python Markdown renderer."""
         suffix = path.suffix.lower()
         if suffix == ".docx":
-            return self._parse_docx(path)
+            return self._docx_to_markdown(path)
         if suffix in (".xlsx", ".xls"):
-            return self._parse_xlsx(path)
+            return self._xlsx_to_markdown(path)
         if suffix in (".pptx", ".ppt"):
-            return self._parse_pptx(path)
-        # Last resort: treat as plain text
-        return self._parse_plaintext(path)
+            return self._pptx_to_markdown(path)
+        # .pdf or unknown
+        return self._pdf_to_markdown(path)
 
-    def _parse_docx(self, path: Path) -> list[DocumentChunk]:
+    def _docx_to_markdown(self, path: Path) -> str:
         import docx  # type: ignore
-
         document = docx.Document(str(path))
-        doc_title = path.stem.title()
-        chunks, headings = [], []
-
+        blocks: list[str] = []
         for para in document.paragraphs:
-            if not para.text.strip():
+            text  = para.text.strip()
+            if not text:
                 continue
-            style = para.style.name if para.style else ""
+            style = (para.style.name or "") if para.style else ""
             if style.startswith("Heading"):
                 try:
-                    lvl = int(style.split()[-1])
+                    level = int(style.split()[-1])
                 except ValueError:
-                    lvl = 1
-                headings = headings[: lvl - 1] + [para.text.strip()[:80]]
-            for sub_text in self._split_text(para.text.strip()):
-                cid = self._make_chunk_id(str(path), None, len(chunks))
-                chunks.append(
-                    DocumentChunk(
-                        chunk_id=cid,
-                        text=sub_text,
-                        doc_path=str(path.resolve()),
-                        doc_title=doc_title,
-                        section_path=list(headings),
-                        metadata={"doctype": "docx"},
-                    )
-                )
-        return chunks
+                    level = 1
+                blocks.append(f"{'#' * min(level, 6)} {text}")
+            else:
+                blocks.append(text)
+        return "\n\n".join(blocks)
 
-    def _parse_xlsx(self, path: Path) -> list[DocumentChunk]:
+    def _xlsx_to_markdown(self, path: Path) -> str:
         import openpyxl  # type: ignore
-
-        wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
-        doc_title = path.stem.title()
-        chunks = []
-
+        wb     = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
+        blocks: list[str] = []
         for sheet_name in wb.sheetnames:
-            ws = wb[sheet_name]
-            rows_text = []
-            for row in ws.iter_rows(values_only=True):
-                row_str = "\t".join(str(c) for c in row if c is not None)
-                if row_str.strip():
-                    rows_text.append(row_str)
-
-            full_text = "\n".join(rows_text)
-            for offset, sub_text in enumerate(self._split_text(full_text)):
-                cid = self._make_chunk_id(str(path), None, offset)
-                chunks.append(
-                    DocumentChunk(
-                        chunk_id=cid,
-                        text=sub_text,
-                        doc_path=str(path.resolve()),
-                        doc_title=doc_title,
-                        section_path=[sheet_name],
-                        metadata={"doctype": "xlsx", "sheet": sheet_name},
-                    )
-                )
+            ws   = wb[sheet_name]
+            rows = list(ws.iter_rows(values_only=True))
+            if not rows:
+                continue
+            blocks.append(f"## {sheet_name}")
+            header = [str(c) if c is not None else "" for c in rows[0]]
+            sep    = ["---"] * len(header)
+            table  = ["| " + " | ".join(header) + " |",
+                      "| " + " | ".join(sep)    + " |"]
+            for row in rows[1:]:
+                cells = [str(c) if c is not None else "" for c in row]
+                while len(cells) < len(header):
+                    cells.append("")
+                table.append("| " + " | ".join(cells[: len(header)]) + " |")
+            blocks.append("\n".join(table))
         wb.close()
-        return chunks
+        return "\n\n".join(blocks)
 
-    def _parse_pptx(self, path: Path) -> list[DocumentChunk]:
+    def _pptx_to_markdown(self, path: Path) -> str:
         from pptx import Presentation  # type: ignore
-
-        prs = Presentation(str(path))
-        doc_title = path.stem.title()
-        chunks = []
-
+        prs    = Presentation(str(path))
+        blocks: list[str] = []
         for slide_num, slide in enumerate(prs.slides, start=1):
-            texts = []
+            texts: list[str] = []
             for shape in slide.shapes:
                 if shape.has_text_frame:
                     for para in shape.text_frame.paragraphs:
                         t = para.text.strip()
                         if t:
                             texts.append(t)
-            full_text = "\n".join(texts)
-            for offset, sub_text in enumerate(self._split_text(full_text)):
-                cid = self._make_chunk_id(str(path), slide_num, offset)
-                chunks.append(
-                    DocumentChunk(
-                        chunk_id=cid,
-                        text=sub_text,
-                        doc_path=str(path.resolve()),
-                        doc_title=doc_title,
-                        page_number=slide_num,
-                        metadata={"doctype": "pptx"},
-                    )
-                )
+            if texts:
+                blocks.append(f"## Slide {slide_num}")
+                blocks.append("\n\n".join(texts))
+        return "\n\n".join(blocks)
+
+    def _pdf_to_markdown(self, path: Path) -> str:
+        """
+        Last-resort text extraction from PDF using pypdf.
+        Produces ``## Page N`` headings with plain text paragraphs.
+        """
+        try:
+            import pypdf  # type: ignore
+            reader = pypdf.PdfReader(str(path))
+            pages: list[str] = []
+            for i, page in enumerate(reader.pages, start=1):
+                text = (page.extract_text() or "").strip()
+                if text:
+                    pages.append(f"## Page {i}\n\n{text}")
+            if pages:
+                return "\n\n".join(pages)
+        except ImportError:
+            logger.debug("pypdf not installed; skipping PDF text extraction.")
+        except Exception as exc:
+            logger.debug("pypdf failed for '%s': %s", path.name, exc)
+
+        # Absolute last resort — raw byte decode
+        try:
+            raw  = path.read_bytes()
+            text = raw.decode("utf-8", errors="replace")
+            text = re.sub(r"[^\x09\x0A\x0D\x20-\x7E\u0080-\uFFFF]+", " ", text)
+            return text[:50_000]
+        except Exception:
+            pass
+        return f"# {path.stem}\n\n(Could not extract text from this PDF.)"
+
+    # -------------------------------------------------------------------------
+    #  Stage 3 — Heading-aware splitter
+    # -------------------------------------------------------------------------
+
+    def _split_with_headings(
+            self,
+            markdown:    str,
+            doc_path_str: str,
+            doc_title:   str,
+            doctype:     str,
+    ) -> list[DocumentChunk]:
+        """
+        Parse Markdown line-by-line, tracking the active heading stack,
+        then flush buffered content into overlapping chunks annotated with
+        the current section_path and page_number.
+
+        ``## Page N`` / ``## Slide N`` markers (emitted by fallback renderers)
+        update ``current_page`` but are NOT added to the section breadcrumb.
+        All other headings update the breadcrumb stack normally.
+        """
+        lines:            list[str]          = markdown.splitlines()
+        current_headings: list[str]          = []
+        current_page:     Optional[int]      = None
+        buffer:           list[str]          = []
+        chunks:           list[DocumentChunk] = []
+        global_offset:    int                = 0
+
+        def _flush(buf: list[str], hdgs: list[str], page: Optional[int]) -> None:
+            nonlocal global_offset
+            joined = "\n".join(buf).strip()
+            if not joined:
+                return
+            for sub in self._split_text(joined):
+                sub = to_utf8(sub)          # re-normalise every chunk
+                if not sub.strip():
+                    continue
+                cid = self._make_chunk_id(doc_path_str, page, global_offset)
+                chunks.append(DocumentChunk(
+                    chunk_id=cid,
+                    text=sub,
+                    doc_path=doc_path_str,
+                    doc_title=doc_title,
+                    page_number=page,
+                    section_path=list(hdgs),
+                    char_offset=global_offset,
+                    metadata={"doctype": doctype, "markdown_source": True},
+                ))
+                global_offset += len(sub)
+
+        for line in lines:
+            hm = _HEADING_RE.match(line)
+            if hm:
+                _flush(buffer, current_headings, current_page)
+                buffer = []
+
+                level   = len(hm.group(1))
+                heading = hm.group(2).strip()[:120]
+
+                pm = _PAGE_RE.match(line)
+                if pm:
+                    # "## Page 3" / "## Slide 3" — page marker from fallback renderer
+                    current_page = int(pm.group(1))
+                else:
+                    # Normal heading — update breadcrumb stack
+                    current_headings = current_headings[: level - 1]
+                    current_headings.append(heading)
+            else:
+                buffer.append(line)
+
+        _flush(buffer, current_headings, current_page)
         return chunks
 
-    def _parse_plaintext(self, path: Path) -> list[DocumentChunk]:
-        text = path.read_text(errors="replace")
-        doc_title = path.stem.title()
-        return [
-            DocumentChunk(
-                chunk_id=self._make_chunk_id(str(path), None, i),
-                text=chunk,
-                doc_path=str(path.resolve()),
-                doc_title=doc_title,
-                metadata={"doctype": path.suffix.lstrip(".")},
-            )
-            for i, chunk in enumerate(self._split_text(text))
-        ]
+    # -------------------------------------------------------------------------
+    #  Public API
+    # -------------------------------------------------------------------------
 
-    # ── Public API ──────────────────────────────────────────────────────────
-
-    def process(self, path: str | Path) -> list[DocumentChunk]:
+    def process(self, path: "str | Path") -> list[DocumentChunk]:
         """
-        Parse a document and return its chunks.
+        Parse *path* and return UTF-8 Markdown chunks.
 
-        Tries Docling first; falls back to pure-Python parsers if Docling
-        is unavailable or raises an exception.
+        Pipeline
+        --------
+        1. Convert to Markdown  (Docling ▸ fallback renderer).
+        2. Normalise to UTF-8   (NFKC, strip control chars).
+        3. Split into chunks    (heading-aware overlapping windows).
 
-        Args:
-            path: Path to the document file.
+        Parameters
+        ----------
+        path : str | Path
 
-        Returns:
-            List of ``DocumentChunk`` objects.
+        Returns
+        -------
+        list[DocumentChunk]  In document order; empty if no text found.
 
-        Raises:
-            ValueError: If the file type is not supported.
-            FileNotFoundError: If the path does not exist.
+        Raises
+        ------
+        FileNotFoundError  – file does not exist.
+        ValueError         – unsupported file type.
         """
         path = Path(path)
         if not path.exists():
@@ -351,24 +464,33 @@ class DoclingProcessor:
                 f"Allowed: {', '.join(sorted(SUPPORTED_SUFFIXES))}"
             )
 
-        try:
-            return self._parse_with_docling(path)
-        except ImportError:
-            logger.warning(
-                "Docling not available – falling back to pure-Python parsers for '%s'.",
-                path.name,
-            )
-            return self._parse_fallback(path)
-        except Exception as exc:
-            logger.warning(
-                "Docling failed for '%s' (%s) – falling back to pure-Python parsers.",
-                path.name,
-                exc,
-            )
-            return self._parse_fallback(path)
+        doc_path_str = str(path.resolve())
+        doc_title    = path.stem.replace("_", " ").replace("-", " ").title()
+        doctype      = path.suffix.lstrip(".")
 
-    def process_many(self, paths: Iterable[str | Path]) -> list[DocumentChunk]:
-        """Process multiple documents and return all chunks combined."""
+        # Stage 1 — Parse → Markdown
+        raw_markdown = self._to_markdown(path)
+
+        # Stage 2 — UTF-8 normalisation
+        normalised = to_utf8(raw_markdown)
+
+        if not normalised.strip():
+            logger.warning("'%s' produced no extractable text.", path.name)
+            return []
+
+        # Stage 3 — Chunk with heading context
+        chunks = self._split_with_headings(
+            normalised, doc_path_str, doc_title, doctype
+        )
+
+        logger.info(
+            "Processed '%s' → %d Markdown chunks (%.1f KB).",
+            path.name, len(chunks), len(normalised) / 1024,
+                                    )
+        return chunks
+
+    def process_many(self, paths: "Iterable[str | Path]") -> list[DocumentChunk]:
+        """Process multiple documents; return all chunks combined."""
         all_chunks: list[DocumentChunk] = []
         for p in paths:
             try:

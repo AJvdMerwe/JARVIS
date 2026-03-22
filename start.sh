@@ -62,7 +62,7 @@ while [[ $# -gt 0 ]]; do
       echo "  voice           REPL with Whisper STT + TTS"
       echo "  api             FastAPI server (REST + WebSocket + SSE)"
       echo "  docker          Full Docker Compose stack"
-      echo "  test            Run the test suite"
+      echo "  test            Run the test suite (844 tests)"
       echo ""
       echo "Options:"
       echo "  --query  TEXT   Run a single query and exit"
@@ -94,8 +94,8 @@ done
 print_banner() {
   echo -e "${CYAN}${BOLD}"
   echo "  ╔══════════════════════════════════════════════════════════╗"
-  echo "  ║         Virtual Personal Assistant  v1.0                 ║"
-  echo "  ║  Code · News · Search · Documents · Voice                ║"
+  echo "  ║         Virtual Personal Assistant  v1.0                ║"
+  echo "  ║  Chat · Code · News · Search · Docs · Finance · Research ║"
   echo "  ╚══════════════════════════════════════════════════════════╝"
   echo -e "${RESET}"
 }
@@ -170,7 +170,8 @@ install_deps() {
   fi
 
   log "Installing Python dependencies…"
-  python -m pip install --upgrade pip wheel setuptools -q
+  # Pin setuptools<81 — vllm requires setuptools<81.0.0,>=77.0.3 on Python>3.11
+  python -m pip install --upgrade pip wheel "setuptools>=77.0.3,<81.0.0" -q
   python -m pip install -r "$req" -q
 
   # Write stamp hash
@@ -199,6 +200,8 @@ LLM_BACKEND=ollama
 OLLAMA_BASE_URL=http://localhost:11434
 OLLAMA_MODEL=llama3.1:8b
 OLLAMA_EMBEDDING_MODEL=nomic-embed-text
+EMBEDDING_BACKEND=ollama
+OLLAMA_REASONING_MODEL=deepseek-r1:7b
 VOICE_ENABLED=false
 WHISPER_MODEL=base
 VECTOR_STORE_PATH=./data/vector_store
@@ -319,6 +322,16 @@ ensure_ollama() {
   else
     log "Pulling embedding model '${embed_model}'…"
     ollama pull "$embed_model" || warn "Could not pull embedding model '${embed_model}'"
+  fi
+
+  # Pull reasoning model for DeepResearchAgent if not present
+  local reason_model="${OLLAMA_REASONING_MODEL:-deepseek-r1:7b}"
+  if echo "$available_models" | grep -qF "${reason_model%%:*}"; then
+    ok "Reasoning model '${reason_model}' is available"
+  else
+    info "Reasoning model '${reason_model}' not found."
+    info "DeepResearchAgent ('research' intent) requires it."
+    info "Pull manually: ollama pull ${reason_model}"
   fi
 }
 

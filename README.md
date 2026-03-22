@@ -61,6 +61,7 @@ bash start.sh --backend vllm api                       # GPU + API server
 | **Direct LLM chat** | ChatAgent talks straight to the model with full conversation history |
 | **Document Q&A** | Ingest PDF, DOCX, XLSX, PPTX, TXT, MD, CSV, HTML, JSON, XML |
 | **Mass document upload** | Concurrent batch ingestion with type detection, deduplication, and dry-run |
+| **PDF → Markdown pipeline** | Every document converted to UTF-8 Markdown before chunking; ligatures and control chars normalised |
 | **Financial analysis** | Stock quotes, ratios, statements, price history, comparisons via Yahoo Finance |
 | **Voice I/O** | Whisper STT (offline, 99 languages) + pyttsx3 TTS |
 | **Dual LLM backend** | Ollama (CPU) or vLLM (GPU) — swap with one env var |
@@ -87,51 +88,51 @@ bash start.sh --backend vllm api                       # GPU + API server
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
 │                            Interfaces                                    │
-│   CLI (Typer)  ·  Interactive REPL  ·  Voice loop  ·  Web UI           │
-│   FastAPI REST ·  WebSocket /ws     ·  SSE /stream  ·  OpenAPI /docs   │
+│   CLI (Typer)  ·  Interactive REPL  ·  Voice loop  ·  Web UI             │
+│   FastAPI REST ·  WebSocket /ws     ·  SSE /stream  ·  OpenAPI /docs     │
 └───────────────────────────────┬──────────────────────────────────────────┘
                                 │
 ┌───────────────────────────────▼──────────────────────────────────────────┐
 │                           Orchestrator                                   │
 │                                                                          │
 │  Intent Router (2-stage)                                                 │
-│    Stage 1: keyword regex + phrase patterns    < 1ms, no LLM call       │
+│    Stage 1: keyword regex + phrase patterns    < 1ms, no LLM call        │
 │    Stage 2: LLM classification                 ambiguous queries only    │
 │                                                                          │
-│  ┌──────┬──────┬──────┬──────────┬──────────┬──────────┬──────────┐    │
-│  │ Chat │ Code │ News │  Search  │ Document │ Finance  │ Research │    │
-│  │Agent │Agent │Agent │  Agent   │  Agent   │  Agent   │  Agent   │    │
-│  └──────┴──────┴──────┴──────────┴──────────┴──────────┴──────────┘    │
+│  ┌──────┬──────┬──────┬──────────┬──────────┬──────────┬──────────┐      │
+│  │ Chat │ Code │ News │  Search  │ Document │ Finance  │ Research │      │
+│  │Agent │Agent │Agent │  Agent   │  Agent   │  Agent   │  Agent   │      │
+│  └──────┴──────┴──────┴──────────┴──────────┴──────────┴──────────┘      │
 │                                                                          │
-│  RAG pre-check → quality gate → fallback chain → synthesis              │
-│  Post-processing: memory · episodic · summariser · tracing              │
+│  RAG pre-check → quality gate → fallback chain → synthesis               │
+│  Post-processing: memory · episodic · summariser · tracing               `│
 └──────────────────────────────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────────────────────────┐
 │                             Core Layer                                   │
 │                                                                          │
-│  llm_manager       Ollama / vLLM factory · @lru_cache singleton         │
-│  resilience        ResilientLLM · CircuitBreaker · retry + failover     │
-│  memory            ConversationMemory · PersistentMemory (JSON)         │
-│  summariser        ConversationSummariser (rolling LLM compression)     │
-│  long_term_memory  EpisodicMemory (ChromaDB, cross-session recall)      │
-│  async_runner      AsyncAgentRunner · fan-out · streaming callbacks     │
-│  cache             ToolCache (TTL, LRU, disk) · @cached_tool            │
-│  tracing           Tracer · Span · TraceStore (JSONL sink)              │
-│  user_prefs        UserPreferences (Pydantic, per-user JSON)            │
-│  scheduler         TaskScheduler (daemon thread, 4 built-in tasks)      │
-│  logging           JsonFormatter · AssistantLogger · agent_call()       │
-│  voice             Whisper STT · MicrophoneListener VAD · pyttsx3 TTS   │
+│  llm_manager       Ollama / vLLM factory · @lru_cache singleton          │
+│  resilience        ResilientLLM · CircuitBreaker · retry + failover      │
+│  memory            ConversationMemory · PersistentMemory (JSON)          │
+│  summariser        ConversationSummariser (rolling LLM compression)      │
+│  long_term_memory  EpisodicMemory (ChromaDB, cross-session recall)       │
+│  async_runner      AsyncAgentRunner · fan-out · streaming callbacks      │
+│  cache             ToolCache (TTL, LRU, disk) · @cached_tool             │
+│  tracing           Tracer · Span · TraceStore (JSONL sink)               │
+│  user_prefs        UserPreferences (Pydantic, per-user JSON)             │
+│  scheduler         TaskScheduler (daemon thread, 4 built-in tasks)       │
+│  logging           JsonFormatter · AssistantLogger · agent_call()        │
+│  voice             Whisper STT · MicrophoneListener VAD · pyttsx3 TTS    │
 └──────────────────────────────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────────────────────────┐
 │                       Document Processing                                │
 │                                                                          │
-│  TypeDetector      12 types · 17 extensions · magic-byte sniffing       │
-│  DoclingProcessor  PDF/DOCX/XLSX/PPTX → DocumentChunk with references   │
-│  MassUploader      concurrent batch · dedup · dry-run · progress hooks  │
-│  DocumentManager   search · stats · delete · LangChain retriever        │
-│  VectorStore       ChromaDB · cosine similarity · idempotent ingest     │
+│  TypeDetector      12 types · 17 extensions · magic-byte sniffing        │
+│  DoclingProcessor  PDF/DOCX/XLSX/PPTX → DocumentChunk with references    │
+│  MassUploader      concurrent batch · dedup · dry-run · progress hooks   │
+│  DocumentManager   search · stats · delete · LangChain retriever         │
+│  VectorStore       ChromaDB · cosine similarity · idempotent ingest      │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -474,6 +475,67 @@ orch = Orchestrator(enable_llm_quality_check=True, max_fallback_attempts=3)
 
 ---
 
+## Document Preprocessing Pipeline
+
+Every document passes through a three-stage pipeline before being stored in
+the vector database.
+
+### Stage 1 — Parse → Markdown
+
+Docling converts the source file to a structured Markdown string that
+preserves headings, GFM pipe-tables, lists, code blocks, and captions. When
+Docling is unavailable, lightweight pure-Python renderers produce equivalent
+Markdown:
+
+| Format | Renderer | Output |
+|---|---|---|
+| PDF | Docling ▸ pypdf | `## Page N` headings + paragraphs |
+| DOCX | Docling ▸ python-docx | `# / ## / ###` headings + body |
+| XLSX | Docling ▸ openpyxl | `## Sheet` + GFM pipe-table per sheet |
+| PPTX | Docling ▸ python-pptx | `## Slide N` headings + body text |
+
+### Stage 2 — UTF-8 normalisation (`to_utf8`)
+
+```
+bytes → decode(source_encoding, errors="replace")
+     → UTF-8 round-trip  (flush lone surrogate code points)
+     → unicodedata.normalize("NFKC")
+           ﬁ→fi · １→1 · ™→TM · composed accents canonicalised
+     → strip control chars (\x00–\x1f, \x7f–\x9f except \t \n \r)
+     → return clean UTF-8 str
+```
+
+Every chunk's `text` field is guaranteed to be valid UTF-8 Markdown — no null
+bytes, no C0/C1 control characters, no lone surrogates — safe for any
+embedding model.
+
+### Stage 3 — Heading-aware chunking
+
+The normalised Markdown is parsed line by line. The active heading stack
+(`# / ## / ###`) is tracked and embedded in every chunk's `section_path` so
+retrieval can surface full provenance. `## Page N` / `## Slide N` markers
+from fallback renderers set the `page_number` field without polluting the
+breadcrumb.
+
+### Chunk metadata
+
+Every `DocumentChunk` carries:
+
+```python
+DocumentChunk(
+    chunk_id      = "a3f9c2d1b8e47f6a",   # SHA-256 of path:page:offset
+    text          = "# Revenue\n\n| Q | Revenue |\n…",  # UTF-8 Markdown
+    doc_path      = "/data/uploads/Q3_Report.pdf",
+    doc_title     = "Q3 Report",
+    page_number   = 4,
+    section_path  = ["Financial Summary", "Revenue Analysis"],
+    metadata      = {
+        "doctype":         "pdf",
+        "markdown_source": True,    # always True after pipeline
+    },
+)
+```
+
 ## Mass Document Upload
 
 Batch-ingest any mix of document types in a single call:
@@ -594,20 +656,24 @@ Options
 python cli.py chat
 python cli.py chat --voice
 python cli.py ask "Explain SOLID"
-python cli.py ask "Write a sort"           --agent code
-python cli.py ask "Hello!"                 --agent chat
-python cli.py ask "Apple stock P/E ratio"  --agent finance
+python cli.py ask "Write a sort"                    --agent code
+python cli.py ask "Hello!"                          --agent chat
+python cli.py ask "Apple stock P/E ratio"           --agent finance
+python cli.py ask "Research climate change"         --agent research
+python cli.py ask "What is CRISPR?" --no-rag        # skip RAG pre-check
 
 python cli.py ingest report.pdf
-python cli.py ingest ./docs/ --directory
+python cli.py ingest ./docs/ --directory --workers 4
+python cli.py ingest ./docs/ --directory --dry-run  # plan only
 
 python cli.py docs list
 python cli.py docs search "revenue Q3"
-python cli.py docs search "costs" --doc "Q3 Report"
+python cli.py docs search "costs" --doc "Q3 Report" --threshold 0.6
 python cli.py docs delete "Q3 Report"
+python cli.py docs stats                            # KB statistics
 
 python cli.py transcribe meeting.wav
-python cli.py config
+python cli.py config                                # show all settings
 ```
 
 ### REPL commands
@@ -623,6 +689,7 @@ python cli.py config
 | `:agent <n>` | Force next query to: `chat` `code` `news` `search` `document` `finance` |
 | `:history` | Show recent conversation |
 | `:voice` | Toggle voice I/O |
+| `:rag on/off` | Enable or disable the RAG pre-check |
 
 ### `admin/admin_cli.py`
 
@@ -1021,7 +1088,7 @@ virtual-assistant/
 │   └── admin_cli.py                    sessions · kb · kb bulk · traces
 │                                       cache · prefs · scheduler · health
 │
-├── tests/                              781 tests · 17 test files · autouse LLM mock
+├── tests/                              781 tests · 18 test files · autouse LLM mock
 │   ├── conftest.py
 │   ├── test_agents.py                  (19)
 │   ├── test_advanced_modules.py        (34)
@@ -1036,6 +1103,7 @@ virtual-assistant/
 │   ├── test_mass_uploader.py           (143)
 │   ├── test_new_modules.py             (41)
 │   ├── test_orchestrator.py            (86)
+│   ├── test_preprocessing_pipeline.py  (62)
 │   ├── test_rag_precheck.py            (49)
 │   ├── test_rate_limiter.py            (18)
 │   ├── test_tools.py                   (23)

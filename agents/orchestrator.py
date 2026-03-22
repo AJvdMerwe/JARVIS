@@ -984,6 +984,69 @@ class Orchestrator:
     #  Async variants
     # -------------------------------------------------------------------------
 
+
+    def stream_response(self, query: str, **kwargs):
+        """
+        Stream an agent response token by token.
+
+        Follows the same routing logic as ``run()`` — intent detection,
+        RAG pre-check, then the primary agent — but yields tokens as they
+        arrive rather than waiting for the full response.
+
+        If the RAG pre-check returns a cached KB answer the full text is
+        yielded as a single token (cached answers are pre-computed).
+
+        Yields
+        ------
+        str  Token string fragments from the agent.
+
+        Notes
+        -----
+        Post-processing (memory save, episodic store, trace) happens after
+        the generator is exhausted, not during streaming.
+        """
+        forced  = kwargs.pop("intent", None)
+        user_id = kwargs.get("user_id", None)
+
+        intent = (
+            Intent(forced) if isinstance(forced, str)
+            else forced if forced
+            else self._route(query)
+        )
+
+        # ── RAG pre-check ─────────────────────────────────────────────────────
+        if self._enable_rag_precheck:
+            try:
+                rag_response = rag_precheck(
+                    query, intent.value,
+                    similarity_threshold=self._rag_similarity_threshold,
+                    k=self._rag_k,
+                )
+            except Exception:
+                rag_response = None
+
+            if rag_response is not None:
+                self._memory.save_context(query, rag_response.output)
+                yield rag_response.output
+                return
+
+        # ── Stream from primary agent ─────────────────────────────────────────
+        agent  = self._agents.get(intent) or self._agents[Intent.CHAT]
+        buffer = []
+
+        try:
+            for token in agent.stream(query, **kwargs):
+                buffer.append(token)
+                yield token
+        except Exception as exc:
+            logger.error("Streaming error in agent '%s': %s", agent.name, exc)
+            yield f"\n[Error: {exc}]"
+            return
+
+        # ── Post-processing ───────────────────────────────────────────────────
+        full_output = "".join(buffer)
+        self._memory.save_context(query, full_output)
+
     async def run_async(self, query: str, **kwargs: Any) -> AgentResponse:
         import asyncio
         return await asyncio.to_thread(self.run, query, **kwargs)

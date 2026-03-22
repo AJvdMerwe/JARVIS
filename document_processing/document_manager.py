@@ -94,6 +94,7 @@ class IngestResult:
     chunks_total: int   = 0
     elapsed_ms:   float = 0.0
     error:        str   = ""
+    metadata:     dict  = field(default_factory=dict)
 
     @property
     def success(self) -> bool:
@@ -544,6 +545,305 @@ class DocumentManager:
             Exact document title (case-sensitive).
         """
         return any(d["doc_title"] == doc_title for d in self.list_documents())
+
+
+    def ingest_or_update(self, path: str | Path) -> IngestResult:
+        """
+        Ingest a document or replace it if a newer version is detected.
+
+        Unlike :meth:`ingest` (which is idempotent and skips existing chunks),
+        this method checks whether the file content has changed by comparing
+        its SHA-256 hash against the hash stored in the existing chunks'
+        metadata.
+
+        Behaviour
+        ---------
+        • If the document is **not** in the KB → ingest normally.
+        • If the document **is** in the KB with the **same** content hash
+          → skip (no change).
+        • If the document **is** in the KB with a **different** content hash
+          → delete all old chunks, then ingest the new version.
+
+        Parameters
+        ----------
+        path : str | Path
+
+        Returns
+        -------
+        IngestResult
+            ``replaced=True`` in ``metadata`` when an old version was deleted.
+        """
+        import hashlib
+        path = Path(path)
+
+        # Compute hash of the new file
+        try:
+            raw  = path.read_bytes()
+            new_hash = hashlib.sha256(raw).hexdigest()
+        except Exception as exc:
+            return IngestResult(
+                filename=path.name,
+                doc_title=path.stem.title(),
+                error=f"Cannot read file: {exc}",
+            )
+
+        # Look up any existing chunks for this doc title
+        doc_title = path.stem.replace("_", " ").replace("-", " ").title()
+        existing  = self._store.get_document_chunks(doc_title)
+
+        if existing:
+            old_hash = existing[0].metadata.get("content_hash", "")
+            if old_hash and old_hash == new_hash:
+                logger.info(
+                    "ingest_or_update: '%s' unchanged (hash match) — skipping.",
+                    path.name,
+                )
+                return IngestResult(
+                    filename=path.name,
+                    doc_title=doc_title,
+                    chunks_added=0,
+                    chunks_total=len(existing),
+                    metadata={"replaced": False, "reason": "unchanged"},
+                )
+
+            # Content changed — replace
+            removed = self.delete_document(doc_title)
+            logger.info(
+                "ingest_or_update: '%s' changed — removed %d old chunk(s), re-ingesting.",
+                path.name, removed,
+            )
+            result = self.ingest_with_result(path)
+            result.metadata = result.metadata or {}
+            result.metadata["replaced"]      = True
+            result.metadata["chunks_removed"] = removed
+            result.metadata["content_hash"]   = new_hash
+            return result
+
+        # Not in KB yet — fresh ingest, store hash in chunk metadata
+        chunks = self._processor.process(path)
+        for chunk in chunks:
+            chunk.metadata["content_hash"] = new_hash
+
+        if not chunks:
+            return IngestResult(filename=path.name, doc_title=doc_title)
+
+        added = self._store.ingest(chunks)
+        self._invalidate_search_cache()
+        logger.info(
+            "ingest_or_update: new document '%s' — %d chunks added.", path.name, added
+        )
+        return IngestResult(
+            filename=path.name,
+            doc_title=doc_title,
+            chunks_added=added,
+            chunks_total=len(chunks),
+            metadata={"replaced": False, "content_hash": new_hash},
+        )
+
+
+    def search_multi_doc(
+        self,
+        query:       str,
+        doc_titles:  list[str],
+        k_per_doc:   int   = 3,
+        similarity_threshold: float | None = None,
+    ) -> dict[str, list]:
+        """
+        Search across multiple documents simultaneously, returning results
+        grouped by document title.
+
+        Useful for comparison queries like "compare the Q2 and Q3 reports".
+        Each document contributes up to *k_per_doc* chunks; results within
+        each document are ranked by cosine similarity.
+
+        Parameters
+        ----------
+        query       : str
+            Natural-language question or search phrase.
+        doc_titles  : list[str]
+            Exact document titles to query.
+        k_per_doc   : int
+            Maximum results per document (default 3).
+        similarity_threshold : float, optional
+            Per-call similarity floor.
+
+        Returns
+        -------
+        dict[str, list[SearchResult]]
+            ``{doc_title: [SearchResult, …]}`` in the order *doc_titles* was given.
+            Documents with no relevant results have an empty list.
+        """
+        threshold = (
+            similarity_threshold
+            if similarity_threshold is not None
+            else self._similarity_threshold
+        )
+        results: dict[str, list] = {}
+        for title in doc_titles:
+            doc_results = self._store.search(query, k=k_per_doc, doc_filter=title)
+            if threshold > 0.0:
+                doc_results = [r for r in doc_results if r.score >= threshold]
+            results[title] = doc_results
+        return results
+
+    def compare_documents(
+        self,
+        query:      str,
+        doc_titles: list[str],
+        k_per_doc:  int = 3,
+    ) -> str:
+        """
+        Retrieve relevant chunks from each document and format them as a
+        side-by-side comparison block for LLM prompt injection.
+
+        Produces::
+
+            ## Comparison: Q2 Report vs Q3 Report
+
+            ### Q2 Report
+            [1] Q2 Report › Page 4 › Revenue (score: 0.88)
+            Revenue for Q2 was $3.9B…
+
+            ### Q3 Report
+            [1] Q3 Report › Page 4 › Revenue (score: 0.91)
+            Revenue for Q3 was $4.2B…
+
+        Parameters
+        ----------
+        query      : str
+        doc_titles : list[str]
+        k_per_doc  : int
+
+        Returns
+        -------
+        str
+            Formatted Markdown comparison block, or a "not found" notice.
+        """
+        if len(doc_titles) < 2:
+            return self.format_search_results(
+                self.search(query, k=k_per_doc * 2)
+            )
+
+        multi = self.search_multi_doc(query, doc_titles, k_per_doc=k_per_doc)
+        title_str = " vs ".join(doc_titles)
+        lines     = [f"## Comparison: {title_str}\n"]
+
+        any_results = False
+        for doc_title, results in multi.items():
+            lines.append(f"### {doc_title}")
+            if not results:
+                lines.append("_(No relevant sections found.)_\n")
+                continue
+            any_results = True
+            for i, r in enumerate(results, 1):
+                text = r.chunk.text[:500]
+                if len(r.chunk.text) > 500:
+                    text += "…"
+                lines.append(
+                    f"**[{i}] {r.reference}** (relevance: {r.score:.2f})\n{text}\n"
+                )
+
+        if not any_results:
+            return f"No relevant sections found in: {', '.join(doc_titles)}"
+        return "\n".join(lines)
+
+
+    def search_with_tables(
+        self,
+        query:               str,
+        k:                   int   = 5,
+        doc_title:           str   | None = None,
+        similarity_threshold: float | None = None,
+    ) -> tuple[list, list]:
+        """
+        Semantic search that separates table chunks from prose chunks.
+
+        Since chunks from the Markdown pipeline that contain pipe-table
+        syntax (``|``) carry structured data, they are returned in a
+        dedicated list so callers can format them differently (e.g. render
+        as a proper table rather than flowing text).
+
+        Parameters
+        ----------
+        query               : str
+        k                   : int
+        doc_title           : str, optional
+        similarity_threshold : float, optional
+
+        Returns
+        -------
+        tuple[list[SearchResult], list[SearchResult]]
+            (table_results, prose_results)  — both ordered by cosine similarity.
+        """
+        all_results = self.search(
+            query, k=k * 2,   # fetch extra to compensate for split
+            doc_title=doc_title,
+            similarity_threshold=similarity_threshold,
+        )
+
+        table_results = []
+        prose_results = []
+        for r in all_results:
+            text = r.chunk.text
+            # A chunk is "table-like" if it contains at least two pipe-table rows
+            pipe_lines = [ln for ln in text.splitlines() if ln.strip().startswith("|")]
+            if len(pipe_lines) >= 2:
+                table_results.append(r)
+            else:
+                prose_results.append(r)
+
+        # Trim to k total, preferring table results
+        return table_results[:k], prose_results[:max(0, k - len(table_results[:k]))]
+
+    def format_table_results(
+        self,
+        table_results: list,
+        prose_results: list,
+        max_chars_per_chunk: int = 800,
+    ) -> str:
+        """
+        Format results from :meth:`search_with_tables` as Markdown.
+
+        Table chunks are placed in a dedicated "Data Tables" section;
+        prose chunks follow in the standard "Document Sections" section.
+
+        Parameters
+        ----------
+        table_results : list[SearchResult]
+        prose_results : list[SearchResult]
+        max_chars_per_chunk : int
+
+        Returns
+        -------
+        str  Formatted Markdown string.
+        """
+        lines: list[str] = []
+
+        if table_results:
+            lines.append("### 📊 Data Tables\n")
+            for i, r in enumerate(table_results, 1):
+                text = r.chunk.text
+                if len(text) > max_chars_per_chunk:
+                    text = text[:max_chars_per_chunk].rstrip() + "…"
+                lines.append(
+                    f"**[T{i}] {r.reference}** "
+                    f"(relevance: {r.score:.2f})\n\n{text}\n"
+                )
+
+        if prose_results:
+            lines.append("### 📄 Relevant Sections\n")
+            for i, r in enumerate(prose_results, 1):
+                text = r.chunk.text
+                if len(text) > max_chars_per_chunk:
+                    text = text[:max_chars_per_chunk].rstrip() + "…"
+                lines.append(
+                    f"**[{i}] {r.reference}** "
+                    f"(relevance: {r.score:.2f})\n\n{text}\n"
+                )
+
+        if not lines:
+            return "No relevant document sections found."
+        return "\n".join(lines)
 
     def delete_document(self, doc_title: str) -> int:
         """

@@ -50,18 +50,18 @@ class DeleteDocInput(BaseModel):
 
 class BulkIngestDirInput(BaseModel):
     directory: str = Field(...,
-                           description="Path to a directory. All supported files are ingested recursively.")
+        description="Path to a directory. All supported files are ingested recursively.")
     recursive: bool = Field(default=True,
-                            description="Descend into sub-directories (default: True).")
+        description="Descend into sub-directories (default: True).")
     dry_run: bool = Field(default=False,
-                          description="If True, detect file types and plan without writing to the store.")
+        description="If True, detect file types and plan without writing to the store.")
 
 
 class BulkIngestFilesInput(BaseModel):
     paths: str = Field(...,
-                       description="Comma-separated list of file paths to ingest.")
+        description="Comma-separated list of file paths to ingest.")
     dry_run: bool = Field(default=False,
-                          description="If True, detect and plan without writing to the store.")
+        description="If True, detect and plan without writing to the store.")
 
 
 # ── Tools ────────────────────────────────────────────────────────────────────
@@ -195,11 +195,110 @@ class DeleteDocumentTool(BaseTool):
         raise NotImplementedError
 
 
+
+class UpdateDocumentInput(BaseModel):
+    file_path: str = Field(..., description="Path to the document file to ingest or update.")
+
+
+class UpdateDocumentTool(BaseTool):
+    """
+    Ingest a document or replace it if its content has changed.
+    Use this instead of ingest_document when you need re-ingest to pick up
+    changes to an existing file without creating duplicate chunks.
+    """
+    name: str = "update_document"
+    description: str = (
+        "Ingest a document or replace it if a newer version is detected. "
+        "Checks the content hash — only re-indexes if the file has changed. "
+        "Input: file_path (str)."
+    )
+    args_schema: type[BaseModel] = UpdateDocumentInput
+
+    def _run(self, file_path: str, **kwargs) -> str:
+        from document_processing import DocumentManager
+        from pathlib import Path
+        dm     = DocumentManager()
+        result = dm.ingest_or_update(Path(file_path))
+        replaced = result.metadata.get("replaced", False) if result.metadata else False
+        if result.error:
+            return f"Error: {result.error}"
+        if replaced:
+            removed = result.metadata.get("chunks_removed", 0) if result.metadata else 0
+            return (
+                f"Updated '{result.doc_title}': removed {removed} old chunks, "
+                f"added {result.chunks_added} new chunks."
+            )
+        if result.chunks_added == 0:
+            return f"'{result.doc_title}' is unchanged — no update needed."
+        return f"Ingested '{result.doc_title}': {result.chunks_added} chunks added."
+
+
+class CompareDocumentsInput(BaseModel):
+    query:      str       = Field(..., description="What to compare across the documents.")
+    doc_titles: list[str] = Field(..., description="Exact titles of 2–4 documents to compare.")
+    k_per_doc:  int       = Field(3, description="Max result chunks per document.")
+
+
+class CompareDocumentsTool(BaseTool):
+    """
+    Search multiple documents simultaneously and format a side-by-side comparison.
+    Use for queries like 'compare the Q2 and Q3 reports' or
+    'how does the 2023 policy differ from the 2024 policy?'.
+    """
+    name: str = "compare_documents"
+    description: str = (
+        "Retrieve relevant sections from multiple documents and format a "
+        "side-by-side comparison. Use when asked to compare, contrast, or "
+        "find differences across two or more documents. "
+        "Inputs: query (str), doc_titles (list of exact document titles), "
+        "k_per_doc (int, default 3)."
+    )
+    args_schema: type[BaseModel] = CompareDocumentsInput
+
+    def _run(self, query: str, doc_titles: list[str], k_per_doc: int = 3, **kwargs) -> str:
+        from document_processing import DocumentManager
+        dm = DocumentManager()
+        return dm.compare_documents(query, doc_titles, k_per_doc=k_per_doc)
+
+
+class TableSearchInput(BaseModel):
+    query:     str           = Field(..., description="Natural-language search query.")
+    k:         int           = Field(5, description="Total results to return.")
+    doc_title: str | None    = Field(None, description="Restrict to one document.")
+
+
+class TableSearchTool(BaseTool):
+    """
+    Search the knowledge base and separate table chunks from prose chunks.
+    Use when the answer is likely in a structured table (financial data,
+    comparison matrices, schedules, etc.).
+    """
+    name: str = "search_documents_tables"
+    description: str = (
+        "Semantic search that separates table (spreadsheet/data) chunks from "
+        "prose chunks. Use for questions about structured data — revenue figures, "
+        "comparison tables, schedules. Returns both table rows and related text. "
+        "Inputs: query (str), k (int, default 5), doc_title (str, optional)."
+    )
+    args_schema: type[BaseModel] = TableSearchInput
+
+    def _run(self, query: str, k: int = 5, doc_title: str | None = None, **kwargs) -> str:
+        from document_processing import DocumentManager
+        dm = DocumentManager()
+        tables, prose = dm.search_with_tables(query, k=k, doc_title=doc_title)
+        if not tables and not prose:
+            return "No relevant document sections found."
+        return dm.format_table_results(tables, prose)
+
+
 def get_document_tools() -> list[BaseTool]:
     """Return all document-related tools."""
     return [
         IngestDocumentTool(),
+        UpdateDocumentTool(),
         SearchDocumentsTool(),
+        TableSearchTool(),
+        CompareDocumentsTool(),
         ListDocumentsTool(),
         GetFullDocumentTool(),
         DeleteDocumentTool(),

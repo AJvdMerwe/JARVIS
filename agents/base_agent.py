@@ -19,14 +19,121 @@ from typing import Any, Optional
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import BaseTool
-from langchain.agents import create_agent
-from langchain_core.prompts import PromptTemplate
 
 from core.llm_manager import get_llm
 from core.memory import AssistantMemory
 from config import settings
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+#  Compatibility shim — replaces the removed AgentExecutor
+# =============================================================================
+
+class _ExecutorCompat:
+    """
+    Drop-in replacement for the old ``langchain.agents.AgentExecutor``.
+
+    Wraps the new ``langchain.agents.create_agent`` compiled graph and
+    exposes the same ``.invoke({"input": query})`` interface that all
+    specialist agents use, returning a dict with ``"output"`` and
+    ``"intermediate_steps"`` keys.
+
+    LangChain 1.x Migration Note
+    ─────────────────────────────
+    ``AgentExecutor`` and ``create_react_agent`` were removed in LangChain
+    1.0.  The replacement is ``langchain.agents.create_agent`` (which
+    internally wraps LangGraph's ``prebuilt.create_react_agent``).  The
+    new graph takes ``{"messages": [...]}`` and returns an ``AgentState``
+    with a ``messages`` list.
+
+    This shim:
+      1. Converts ``{"input": query}`` → ``{"messages": [HumanMessage(query)]}``
+      2. Invokes the graph (respecting ``max_iterations`` via a timeout guard)
+      3. Extracts the final assistant message as ``"output"``
+      4. Reconstructs ``"intermediate_steps"`` from tool-call messages so
+         ``_extract_tool_calls()`` continues to work unchanged
+    """
+
+    def __init__(self, graph, max_iterations: int = 15) -> None:
+        self._graph          = graph
+        self._max_iterations = max_iterations
+
+    def invoke(self, inputs: dict, **kwargs) -> dict:
+        """
+        Execute the agent graph and return a legacy-compatible result dict.
+
+        Parameters
+        ----------
+        inputs : dict
+            Must contain ``"input"`` (str) — the user query.
+
+        Returns
+        -------
+        dict
+            ``{"output": str, "intermediate_steps": list[tuple]}``
+        """
+        from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+
+        query    = inputs.get("input", "")
+        messages = [HumanMessage(content=query)]
+
+        try:
+            state = self._graph.invoke(
+                {"messages": messages},
+                config={"recursion_limit": self._max_iterations * 3},
+            )
+        except Exception as exc:
+            return {"output": f"Agent error: {exc}", "intermediate_steps": []}
+
+        all_messages = getattr(state, "messages", [])
+
+        # ── Extract final output ──────────────────────────────────────────────
+        output = ""
+        for msg in reversed(all_messages):
+            if isinstance(msg, AIMessage) and msg.content:
+                content = msg.content
+                if isinstance(content, list):
+                    # Some models return content as list of blocks
+                    parts = [
+                        b.get("text", "") if isinstance(b, dict) else str(b)
+                        for b in content
+                    ]
+                    content = "".join(parts)
+                if content.strip():
+                    output = str(content).strip()
+                    break
+
+        # ── Reconstruct intermediate_steps ────────────────────────────────────
+        # Format: list of (AgentAction-like, observation) pairs
+        # We approximate this from ToolMessage pairs in the message list
+        intermediate_steps: list[tuple] = []
+        pending_tool_call: dict | None  = None
+
+        for msg in all_messages:
+            if isinstance(msg, AIMessage) and msg.tool_calls:
+                for tc in msg.tool_calls:
+                    pending_tool_call = tc
+            elif isinstance(msg, ToolMessage) and pending_tool_call:
+                # Reconstruct a minimal action-like namespace
+                class _Action:
+                    def __init__(self, name, inp):
+                        self.tool       = name
+                        self.tool_input = inp
+                        self.log        = f"Calling {name}"
+
+                action = _Action(
+                    pending_tool_call.get("name", "tool"),
+                    pending_tool_call.get("args", {}),
+                )
+                intermediate_steps.append((action, str(msg.content)[:500]))
+                pending_tool_call = None
+
+        return {
+            "output":             output or "No answer generated.",
+            "intermediate_steps": intermediate_steps,
+        }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -89,10 +196,10 @@ class BaseAgent(ABC):
     """
 
     def __init__(
-            self,
-            llm: Optional[BaseChatModel] = None,
-            memory: Optional[AssistantMemory] = None,
-            verbose: bool = settings.agent_verbose,
+        self,
+        llm: Optional[BaseChatModel] = None,
+        memory: Optional[AssistantMemory] = None,
+        verbose: bool = settings.agent_verbose,
     ) -> None:
         self._llm = llm or get_llm()
         self._memory = memory or AssistantMemory()
@@ -130,124 +237,51 @@ class BaseAgent(ABC):
 
     # ── Shared helpers ───────────────────────────────────────────────────────
 
-        # def _build_react_agent(self, system_prompt: Optional[str] = None):
-        #     """
-        #     Build a LangChain ReAct agent executor with this agent's tools.
-        #     Shared utility so subclasses don't repeat boilerplate.
-        #     """
-        #     from langchain.agents import AgentExecutor, create_react_agent
-        #     from langchain_core.prompts import PromptTemplate
-        #
-        #     tools = self.get_tools()
-        #
-        #     # Build tool descriptions string for the prompt
-        #     tool_descriptions = "\n".join(
-        #         f"- {t.name}: {t.description}" for t in tools
-        #     )
-        #     tool_names = ", ".join(t.name for t in tools)
-        #
-        #     base_prompt = system_prompt or (
-        #         f"You are a helpful assistant specialised in: {self.description}.\n"
-        #         "Answer the human's question as best you can using the available tools."
-        #     )
-        #
-        #     template = (
-        #         f"{base_prompt}\n\n"
-        #         "You have access to the following tools:\n"
-        #         "{tools}\n\n"
-        #         "Use the following format:\n"
-        #         "Question: the input question you must answer\n"
-        #         "Thought: you should always think about what to do\n"
-        #         "Action: the action to take, should be one of [{tool_names}]\n"
-        #         "Action Input: the input to the action\n"
-        #         "Observation: the result of the action\n"
-        #         "... (this Thought/Action/Action Input/Observation can repeat N times)\n"
-        #         "Thought: I now know the final answer\n"
-        #         "Final Answer: the final answer to the original input question\n\n"
-        #         "Begin!\n\n"
-        #         "Question: {input}\n"
-        #         "Thought: {agent_scratchpad}"
-        #     )
-        #
-        #     prompt = PromptTemplate.from_template(template).partial(
-        #         tools=tool_descriptions,
-        #         tool_names=tool_names,
-        #     )
-        #
-        #     agent = create_react_agent(self._llm, tools, prompt)
-        #     return AgentExecutor(
-        #         agent=agent,
-        #         tools=tools,
-        #         memory=self._memory.lc_memory,
-        #         max_iterations=settings.agent_max_iterations,
-        #         verbose=self._verbose,
-        #         handle_parsing_errors=True,
-        #         return_intermediate_steps=True,
-        #     )
-
-
     def _build_react_agent(self, system_prompt: Optional[str] = None):
         """
-        Build a modern LangChain agent.
-        In v1.2+, create_agent returns a compiled graph that handles
-        execution, so AgentExecutor is no longer required.
+        Build a tool-calling agent compatible with LangChain 1.x.
+
+        LangChain 1.x removed ``AgentExecutor`` and ``create_react_agent``.
+        This method builds an equivalent agent using the new
+        ``langchain.agents.create_agent`` API (which wraps LangGraph's
+        ``create_react_agent`` under the hood) and returns a thin
+        ``_ExecutorCompat`` wrapper that preserves the original
+        ``.invoke({"input": query})`` call-site interface used by every
+        specialist agent.
+
+        The returned object satisfies::
+
+            result = executor.invoke({"input": query})
+            output       = result["output"]           # str
+            tool_calls   = result["intermediate_steps"]  # list[tuple]
+
+        Parameters
+        ----------
+        system_prompt : str, optional
+            Custom system message.  Defaults to a generic description-based prompt.
+
+        Returns
+        -------
+        _ExecutorCompat
+            Drop-in replacement for the old AgentExecutor.
         """
+        from langchain.agents import create_agent
+
         tools = self.get_tools()
-
-        # Build tool descriptions string for the prompt
-        tool_descriptions = "\n".join(
-            f"- {t.name}: {t.description}" for t in tools
-        )
-        tool_names = ", ".join(t.name for t in tools)
-
-        base_prompt = system_prompt or (
-            f"You are a helpful assistant specialised in: {self.description}.\n"
-            "Answer the human's question as best you can using the available tools."
-        )
-
-        template = (
-            f"{base_prompt}\n\n"
-            "You have access to the following tools:\n"
-            "{tools}\n\n"
-            "Use the following format:\n"
-            "Question: the input question you must answer\n"
-            "Thought: you should always think about what to do\n"
-            "Action: the action to take, should be one of [{tool_names}]\n"
-            "Action Input: the input to the action\n"
-            "Observation: the result of the action\n"
-            "... (this Thought/Action/Action Input/Observation can repeat N times)\n"
-            "Thought: I now know the final answer\n"
-            "Final Answer: the final answer to the original input question\n\n"
-            "Begin!\n\n"
-            "Question: {input}\n"
-            "Thought: {agent_scratchpad}"
-        )
-
-        prompt = PromptTemplate.from_template(template).partial(
-            tools=tool_descriptions,
-            tool_names=tool_names,
-        )
-
         prompt = system_prompt or (
-            f"You are a helpful assistant specialised in: {self.description}."
+            f"You are a helpful assistant specialised in: {self.description}.\n"
+            "Use the available tools to answer the user's question thoroughly."
         )
 
-        # create_agent returns an executable 'agent' object (a compiled graph)
-        agent = create_agent(
-            model=self._llm,
+        graph = create_agent(
+            self._llm,
             tools=tools,
             system_prompt=prompt,
-            # 'checkpointer' replaces manual memory management
-            # 'max_steps' replaces max_iterations
-            # max_steps=getattr(settings, "agent_max_iterations", 10),
-            # handle_tool_errors=True,
-            # stream_runnables=True
         )
-
-        return agent
+        return _ExecutorCompat(graph, max_iterations=settings.agent_max_iterations)
 
     def _extract_tool_calls(
-            self, intermediate_steps: list
+        self, intermediate_steps: list
     ) -> list[tuple[str, str, str]]:
         """Parse LangChain intermediate_steps into our cleaner tuple format."""
         calls = []
@@ -258,6 +292,46 @@ class BaseAgent(ABC):
                 str(observation)[:500],
             ))
         return calls
+
+
+
+    def stream(self, query: str, **kwargs):
+        """
+        Yield response tokens one by one.
+
+        Default implementation falls back to ``run()`` and yields the full
+        output as a single token.  Subclasses override this to provide true
+        token-by-token streaming (ChatAgent already does).
+
+        Yields
+        ------
+        str  Token string fragments.
+        """
+        response = self.run(query, **kwargs)
+        if response.output:
+            yield response.output
+
+    def _augment_query(self, query: str, force_context: bool = False) -> str:
+        """
+        Prepend recent conversation context to *query* when appropriate.
+
+        Called by specialist agents (search, code, finance, news) at the
+        start of their ``run()`` methods so every agent benefits from
+        conversation history — not just ChatAgent.
+
+        Context is injected when:
+          • ``force_context=True``, OR
+          • the query is detected as a follow-up (short / referential / pronoun)
+
+        See ``core.conversation_context`` for detection heuristics.
+        """
+        try:
+            from core.conversation_context import inject_context_into_prompt
+            return inject_context_into_prompt(
+                query, self._memory, query, force=force_context
+            )
+        except Exception:
+            return query   # never block the agent
 
     @property
     def memory(self) -> AssistantMemory:

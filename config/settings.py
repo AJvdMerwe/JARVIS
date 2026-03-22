@@ -22,8 +22,7 @@ class Settings(BaseSettings):
 
     # ── Ollama ──────────────────────────────────────────────────────────────
     ollama_base_url: str = "http://localhost:11434"
-    ollama_model: str = "llama3.2:3b"
-    ollama_embedding_model: str = "nomic-embed-text"
+    ollama_model: str = "llama3.1:8b"
 
     # ── vLLM ────────────────────────────────────────────────────────────────
     vllm_base_url: str = "http://localhost:8000/v1"
@@ -41,7 +40,27 @@ class Settings(BaseSettings):
     # ── Vector store ────────────────────────────────────────────────────────
     vector_store_path: Path = Path("./data/vector_store")
     vector_store_collection: str = "assistant_docs"
+
+    # Embedding backend: "huggingface" (in-process, may use GPU)
+    #                 or "ollama"      (out-of-process, zero app VRAM)
+    embedding_backend: Literal["huggingface", "ollama"] = "huggingface"
+
+    # HuggingFace model path / repo name (only used when backend=huggingface)
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+
+    # Device for HuggingFace embeddings: "cpu" | "cuda" | "mps" | "auto"
+    # Default "cpu" — safe for low-VRAM setups.
+    # Set "cuda" explicitly only when you have headroom after Docling + LLM.
+    embedding_device: Literal["cpu", "cuda", "mps", "auto"] = "cpu"
+
+    # Ollama embedding model (only used when backend=ollama)
+    # Good low-VRAM choices: nomic-embed-text, nomic-embed-text-v2-moe, mxbai-embed-large
+    ollama_embedding_model: str = "nomic-embed-text"
+
+    # Number of texts embedded per call to the embedding model.
+    # Smaller batches reduce peak memory usage at the cost of throughput.
+    embedding_batch_size: int = Field(32, ge=1, le=512)
+
     chunk_size: int = Field(512, ge=64, le=4096)
     chunk_overlap: int = Field(64, ge=0, le=512)
 

@@ -11,8 +11,13 @@ Architecture:
   │  User Input                                                             │
   │      │                                                                  │
   │      ▼                                                                  │
-  │  Intent Router  ──► keyword heuristics (fast, no LLM)                  │
+  │  Intent Router  ──► keyword heuristics (fast, no LLM)                   │
   │      │          └──► LLM classifier    (fallback for ambiguous queries) │
+  │      │                                                                  │
+  │      ▼                                                                  │
+  │  RAG Pre-check  ──► vector-store scan (fast, < 200 ms)                  │
+  │      │          ├──► SUFFICIENT ──► post-process & return               │
+  │      │          └──► INSUFFICIENT / SKIP ──► Primary Agent              │
   │      │                                                                  │
   │      ▼                                                                  │
   │  Primary Agent (chosen by intent)                                       │
@@ -20,15 +25,15 @@ Architecture:
   │      ▼                                                                  │
   │  Response Quality Check                                                 │
   │      │                                                                  │
-  │      ├── SUFFICIENT ──► Post-process & return                          │
+  │      ├── SUFFICIENT ──► Post-process & return                           │
   │      │                                                                  │
-  │      └── INSUFFICIENT ──► Fallback Chain                               │
+  │      └── INSUFFICIENT ──► Fallback Chain                                │
   │               │                                                         │
-  │               ├── Fallback Agent 1 → quality check → ...               │
-  │               ├── Fallback Agent 2 → quality check → ...               │
-  │               └── Final synthesis (LLM merges best evidence)           │
+  │               ├── Fallback Agent 1 → quality check → ...                │
+  │               ├── Fallback Agent 2 → quality check → ...                │
+  │               └── Final synthesis (LLM merges best evidence)            │
   │                                                                         │
-  │  Post-processing (memory · episodic · summariser · tracing)            │
+  │  Post-processing (memory · episodic · summariser · tracing)             │
   └─────────────────────────────────────────────────────────────────────────┘
 
 Fallback chains (per intent, highest priority first):
@@ -65,6 +70,7 @@ from .code_agent import CodeAgent
 from .document_agent import DocumentAgent
 from .financial_agent import FinancialAgent
 from .news_agent import NewsAgent
+from .rag_precheck import rag_precheck
 from .search_agent import SearchAgent
 from core.memory import PersistentMemory
 from core.llm_manager import get_llm
@@ -538,6 +544,16 @@ class Orchestrator:
     enable_llm_quality_check : bool
         Use the LLM to judge response quality (more accurate, slower).
         Default False — fast pattern-matching gates are used instead.
+    enable_rag_precheck : bool
+        Scan the vector store after intent detection and before calling any
+        agent.  When a sufficiently relevant answer is found in the KB the
+        primary agent is never invoked (faster, cheaper).  Default True.
+    rag_similarity_threshold : float
+        Minimum cosine similarity for a chunk to be considered relevant
+        during the pre-check.  Range 0–1; default 0.55.
+    rag_k : int
+        Maximum number of chunks to retrieve during the pre-check.
+        Default 4.
     max_fallback_attempts : int
         Maximum number of fallback agents to try after the primary fails.
         Default 2.  Set to 0 to disable fallback entirely.
@@ -549,18 +565,24 @@ class Orchestrator:
 
     def __init__(
             self,
-            session_id:                str  = "default",
-            enable_episodic:           bool = False,
-            enable_summariser:         bool = False,
-            enable_plugins:            bool = True,
-            enable_scheduler:          bool = False,
-            enable_llm_quality_check:  bool = False,
-            max_fallback_attempts:     int  = 2,
-            summarise_after:           int  = 40,
-            recent_k:                  int  = 10,
+            session_id:                str   = "default",
+            enable_episodic:           bool  = False,
+            enable_summariser:         bool  = False,
+            enable_plugins:            bool  = True,
+            enable_scheduler:          bool  = False,
+            enable_llm_quality_check:  bool  = False,
+            enable_rag_precheck:       bool  = True,
+            rag_similarity_threshold:  float = 0.55,
+            rag_k:                     int   = 4,
+            max_fallback_attempts:     int   = 2,
+            summarise_after:           int   = 40,
+            recent_k:                  int   = 10,
     ) -> None:
         self._session_id               = session_id
         self._enable_llm_quality_check = enable_llm_quality_check
+        self._enable_rag_precheck      = enable_rag_precheck
+        self._rag_similarity_threshold = rag_similarity_threshold
+        self._rag_k                    = rag_k
         self._max_fallback_attempts    = max_fallback_attempts
 
         self._memory = PersistentMemory(session_id=session_id)
@@ -601,10 +623,12 @@ class Orchestrator:
 
         logger.info(
             "Orchestrator ready | session='%s' | agents=%d | "
-            "fallback=%s (max=%d) | llm_quality=%s",
+            "fallback=%s (max=%d) | llm_quality=%s | rag_precheck=%s (thresh=%.2f)",
             session_id, len(self._agents),
             "on", self._max_fallback_attempts,
             self._enable_llm_quality_check,
+            self._enable_rag_precheck,
+            self._rag_similarity_threshold,
         )
 
     # -------------------------------------------------------------------------
@@ -619,14 +643,16 @@ class Orchestrator:
         Execution flow
         --------------
         1.  Detect intent (keyword → LLM fallback).
-        2.  Call the primary agent.
-        3.  Evaluate response quality (fast gates + optional LLM judge).
-        4.  If INSUFFICIENT and fallback is enabled:
+        2.  RAG pre-check: scan vector store for a direct answer.
+            If sufficient answer found → post-process and return immediately.
+        3.  Call the primary agent.
+        4.  Evaluate response quality (fast gates + optional LLM judge).
+        5.  If INSUFFICIENT and fallback is enabled:
               a. Try each agent in the intent's fallback chain.
               b. Re-evaluate quality after each attempt.
               c. Return the first SUFFICIENT response.
-        5.  If all attempts fail: synthesise from all evidence via LLM.
-        6.  Post-process: persist memory, extract episodic facts,
+        6.  If all attempts fail: synthesise from all evidence via LLM.
+        7.  Post-process: persist memory, extract episodic facts,
             maybe summarise, record trace.
 
         Parameters
@@ -665,6 +691,35 @@ class Orchestrator:
             self._inject_episodic_context(query, kwargs)
         if user_id:
             kwargs.setdefault("user_id", user_id)
+
+        # ── RAG pre-check ─────────────────────────────────────────────────────
+        # Quick vector-store scan: if the KB already contains a good answer
+        # return it immediately without invoking any agent.
+        if self._enable_rag_precheck:
+            try:
+                rag_response = rag_precheck(
+                    query,
+                    intent.value,
+                    similarity_threshold=self._rag_similarity_threshold,
+                    k=self._rag_k,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "RAG pre-check raised an unexpected error: %s — continuing.", exc
+                )
+                rag_response = None
+
+            if rag_response is not None:
+                self._close_trace(trace_obj, rag_response)
+                self._memory.save_context(query, rag_response.output)
+                if getattr(self, "_episodic", None) and rag_response.output:
+                    self._store_episodic_facts(query, rag_response.output)
+                if getattr(self, "_summariser", None):
+                    try:
+                        self._summariser.maybe_summarise(self._memory)
+                    except Exception as exc:
+                        logger.debug("Summariser error: %s", exc)
+                return rag_response
 
         # ── Primary attempt ───────────────────────────────────────────────────
         primary_agent = self._agents.get(intent) or self._agents[Intent.CHAT]
@@ -1059,5 +1114,6 @@ class Orchestrator:
         )
         return (
             f"<Orchestrator session='{self._session_id}' "
-            f"agents=[{agents_str}] fallback_max={self._max_fallback_attempts}>"
+            f"agents=[{agents_str}] fallback_max={self._max_fallback_attempts} "
+            f"rag_precheck={self._enable_rag_precheck}>"
         )

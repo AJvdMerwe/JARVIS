@@ -95,15 +95,27 @@ class VectorStore:
 
     # ── Ingestion ────────────────────────────────────────────────────────────
 
-    def ingest(self, chunks: list[DocumentChunk], batch_size: int = 64) -> int:
+    def ingest(self, chunks: list[DocumentChunk], batch_size: int | None = None) -> int:
         """
         Add chunks to the collection. Skips chunks already present
         (idempotent based on ``chunk_id``).
 
-        Returns:
+        Parameters
+        ----------
+        chunks : list[DocumentChunk]
+        batch_size : int, optional
+            Override the default ``settings.embedding_batch_size``.
+            Smaller values reduce peak memory; larger values improve throughput.
+
+        Returns
+        -------
+        int
             Number of *new* chunks actually added.
         """
+        from config import settings as _s
         self._ensure_ready()
+
+        effective_batch = batch_size if batch_size is not None else _s.embedding_batch_size
 
         # Find which chunk_ids are new
         existing_ids: set[str] = set()
@@ -119,8 +131,8 @@ class VectorStore:
             return 0
 
         added = 0
-        for start in range(0, len(new_chunks), batch_size):
-            batch = new_chunks[start : start + batch_size]
+        for start in range(0, len(new_chunks), effective_batch):
+            batch = new_chunks[start : start + effective_batch]
             texts = [c.text for c in batch]
             ids = [c.chunk_id for c in batch]
             metas = [

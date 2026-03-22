@@ -41,7 +41,7 @@ bash start.sh --help                                   # all options
 bash start.sh voice                                    # mic + TTS
 bash start.sh api                                      # FastAPI server on :8080
 bash start.sh docker                                   # full Docker Compose stack
-bash start.sh test                                     # run the 597-test suite
+bash start.sh test                                     # run the 644-test suite
 bash start.sh --query "Explain recursion like I'm five"
 bash start.sh --ingest ./reports/
 bash start.sh --model llama3.2:3b                      # lighter model
@@ -85,51 +85,51 @@ bash start.sh --backend vllm api                       # GPU + API server
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
 │                            Interfaces                                    │
-│   CLI (Typer)  ·  Interactive REPL  ·  Voice loop  ·  Web UI             │
-│   FastAPI REST ·  WebSocket /ws     ·  SSE /stream  ·  OpenAPI /docs     │
+│   CLI (Typer)  ·  Interactive REPL  ·  Voice loop  ·  Web UI           │
+│   FastAPI REST ·  WebSocket /ws     ·  SSE /stream  ·  OpenAPI /docs   │
 └───────────────────────────────┬──────────────────────────────────────────┘
                                 │
 ┌───────────────────────────────▼──────────────────────────────────────────┐
 │                           Orchestrator                                   │
 │                                                                          │
 │  Intent Router (2-stage)                                                 │
-│    Stage 1: keyword regex + phrase patterns    < 1ms, no LLM call        │
+│    Stage 1: keyword regex + phrase patterns    < 1ms, no LLM call       │
 │    Stage 2: LLM classification                 ambiguous queries only    │
 │                                                                          │
-│  ┌──────┬──────┬──────┬──────────┬──────────┬──────────┐                 │
-│  │ Chat │ Code │ News │  Search  │ Document │ Finance  │                 │
-│  │Agent │Agent │Agent │  Agent   │  Agent   │  Agent   │                 │
-│  └──────┴──────┴──────┴──────────┴──────────┴──────────┘                 │
+│  ┌──────┬──────┬──────┬──────────┬──────────┬──────────┐               │
+│  │ Chat │ Code │ News │  Search  │ Document │ Finance  │               │
+│  │Agent │Agent │Agent │  Agent   │  Agent   │  Agent   │               │
+│  └──────┴──────┴──────┴──────────┴──────────┴──────────┘               │
 │                                                                          │
-│  Quality gate → fallback chain → synthesis (when needed)                 │
-│  Post-processing: memory · episodic · summariser · tracing               │
+│  Quality gate → fallback chain → synthesis (when needed)                │
+│  Post-processing: memory · episodic · summariser · tracing              │
 └──────────────────────────────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────────────────────────┐
 │                             Core Layer                                   │
 │                                                                          │
-│  llm_manager       Ollama / vLLM factory · @lru_cache singleton          │
-│  resilience        ResilientLLM · CircuitBreaker · retry + failover      │
-│  memory            ConversationMemory · PersistentMemory (JSON)          │
-│  summariser        ConversationSummariser (rolling LLM compression)      │
-│  long_term_memory  EpisodicMemory (ChromaDB, cross-session recall)       │
-│  async_runner      AsyncAgentRunner · fan-out · streaming callbacks      │
-│  cache             ToolCache (TTL, LRU, disk) · @cached_tool             │
-│  tracing           Tracer · Span · TraceStore (JSONL sink)               │
-│  user_prefs        UserPreferences (Pydantic, per-user JSON)             │
-│  scheduler         TaskScheduler (daemon thread, 4 built-in tasks)       │
-│  logging           JsonFormatter · AssistantLogger · agent_call()        │
-│  voice             Whisper STT · MicrophoneListener VAD · pyttsx3 TTS    │
+│  llm_manager       Ollama / vLLM factory · @lru_cache singleton         │
+│  resilience        ResilientLLM · CircuitBreaker · retry + failover     │
+│  memory            ConversationMemory · PersistentMemory (JSON)         │
+│  summariser        ConversationSummariser (rolling LLM compression)     │
+│  long_term_memory  EpisodicMemory (ChromaDB, cross-session recall)      │
+│  async_runner      AsyncAgentRunner · fan-out · streaming callbacks     │
+│  cache             ToolCache (TTL, LRU, disk) · @cached_tool            │
+│  tracing           Tracer · Span · TraceStore (JSONL sink)              │
+│  user_prefs        UserPreferences (Pydantic, per-user JSON)            │
+│  scheduler         TaskScheduler (daemon thread, 4 built-in tasks)      │
+│  logging           JsonFormatter · AssistantLogger · agent_call()       │
+│  voice             Whisper STT · MicrophoneListener VAD · pyttsx3 TTS   │
 └──────────────────────────────────────────────────────────────────────────┘
-`
+
 ┌──────────────────────────────────────────────────────────────────────────┐
 │                       Document Processing                                │
 │                                                                          │
-│  TypeDetector      12 types · 17 extensions · magic-byte sniffing        │
-│  DoclingProcessor  PDF/DOCX/XLSX/PPTX → DocumentChunk with references    │
-│  MassUploader      concurrent batch · dedup · dry-run · progress hooks   │
-│  DocumentManager   search · stats · delete · LangChain retriever         │
-│  VectorStore       ChromaDB · cosine similarity · idempotent ingest      │
+│  TypeDetector      12 types · 17 extensions · magic-byte sniffing       │
+│  DoclingProcessor  PDF/DOCX/XLSX/PPTX → DocumentChunk with references   │
+│  MassUploader      concurrent batch · dedup · dry-run · progress hooks  │
+│  DocumentManager   search · stats · delete · LangChain retriever        │
+│  VectorStore       ChromaDB · cosine similarity · idempotent ingest     │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -146,9 +146,9 @@ Two-stage pipeline — Stage 1 is regex (< 1 ms, no LLM call); Stage 2 calls the
 "Write a haiku about autumn"      →  CHAT     (creative "write a haiku")
 "Write a quicksort in Python"     →  CODE     (code noun after "write")
 "Debug this TypeError"            →  CODE     (debug keyword)
-"What are today's headlines?"     →  NEWS     (headlines keyword)
+"What are today's headlines?"    →  NEWS     (headlines keyword)
 "Summarise the uploaded PDF"      →  DOCUMENT (document keyword)
-"What is Apple's stock price?"    →  FINANCE  (stock price keyword)
+"What is Apple's stock price?"   →  FINANCE  (stock price keyword)
 "AAPL P/E ratio"                  →  FINANCE  (ratio keyword)
 "What is the capital of France?"  →  SEARCH   (no other signals)
 "Anything ambiguous…"             →  LLM classifies → defaults to CHAT
@@ -365,7 +365,7 @@ Modes
   voice     REPL with Whisper STT + TTS
   api       FastAPI server on :8080
   docker    Full Docker Compose stack
-  test      Run the 597-test suite
+  test      Run the 644-test suite
 
 Options
   --query  TEXT   Single query, print response, exit
@@ -526,7 +526,11 @@ Response:
 | `VOICE_ENABLED` | `false` | Enable mic + TTS |
 | `WHISPER_MODEL` | `base` | `tiny` / `base` / `small` / `medium` / `large` |
 | `VOICE_LANGUAGE` | `en` | ISO 639-1 language code |
-| `EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | Local embeddings |
+| `EMBEDDING_BACKEND` | `huggingface` | `huggingface` \| `ollama` |
+| `EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | HuggingFace model (backend=huggingface) |
+| `EMBEDDING_DEVICE` | `cpu` | `cpu` \| `cuda` \| `mps` \| `auto` (HF backend only) |
+| `OLLAMA_EMBEDDING_MODEL` | `nomic-embed-text` | Ollama model (backend=ollama) |
+| `EMBEDDING_BATCH_SIZE` | `32` | Texts per embedding call (lower = less VRAM) |
 | `CHUNK_SIZE` | `512` | Document chunk size (chars) |
 | `CHUNK_OVERLAP` | `64` | Overlap between adjacent chunks |
 | `VECTOR_STORE_PATH` | `./data/vector_store` | ChromaDB path |
@@ -546,6 +550,68 @@ Response:
 | GPU 16 GB+ | vLLM: `mistralai/Mistral-7B-Instruct-v0.2` |
 
 ---
+
+
+## Embedding Backends
+
+The assistant supports two embedding backends, selectable via `EMBEDDING_BACKEND` in `.env`.
+
+### HuggingFace (default)
+
+Loads a sentence-transformers model in-process. Fast and self-contained, but the model shares GPU memory with Docling and the LLM.
+
+```bash
+EMBEDDING_BACKEND=huggingface
+EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
+EMBEDDING_DEVICE=cpu    # safe default — no GPU competition
+# EMBEDDING_DEVICE=cuda # only if you have headroom after Docling + LLM
+```
+
+### Ollama (recommended for low-VRAM GPUs)
+
+Sends embedding requests to the Ollama HTTP server. The model runs inside the Ollama process — **zero application VRAM**. This is the correct fix for `torch.OutOfMemoryError` during document ingestion.
+
+```bash
+EMBEDDING_BACKEND=ollama
+OLLAMA_EMBEDDING_MODEL=nomic-embed-text   # pull first: ollama pull nomic-embed-text
+EMBEDDING_BATCH_SIZE=16                   # conservative for 6 GB GPU
+```
+
+Supported Ollama embedding models:
+
+| Model | Params | Dims | Notes |
+|---|---|---|---|
+| `nomic-embed-text` | 137 M | 768 | Fast, good default |
+| `nomic-embed-text-v2-moe` | MoE | 768 | Higher quality, same speed |
+| `mxbai-embed-large` | 335 M | 1024 | Best quality |
+| `all-minilm` | 23 M | 384 | Smallest, fastest |
+
+Pull a model before switching:
+
+```bash
+ollama pull nomic-embed-text
+ollama pull nomic-embed-text-v2-moe
+```
+
+### Switching backends at runtime
+
+```python
+from core.llm_manager import clear_embeddings_cache
+# After changing settings:
+clear_embeddings_cache()
+# Next call to get_embeddings() rebuilds from current settings
+```
+
+### Batch size tuning
+
+`EMBEDDING_BATCH_SIZE` controls how many texts are embedded per call. Lower values reduce peak memory at the cost of throughput:
+
+| GPU VRAM | Recommended batch size |
+|---|---|
+| ≥ 16 GB | 64–128 |
+| 8–16 GB | 32 (default) |
+| 4–8 GB | 8–16 |
+| < 4 GB | 1–4 (use Ollama backend instead) |
 
 ## Adding a New Agent
 
@@ -645,7 +711,7 @@ docker compose run -it --rm assistant
 
 ```bash
 make install-dev    # venv + all deps + dev extras
-make test           # 597 tests
+make test           # 644 tests
 make test-cov       # with HTML coverage → data/coverage/
 make test-unit      # unit tests only
 make test-api       # API tests only
@@ -737,13 +803,14 @@ virtual-assistant/
 │   └── admin_cli.py                    sessions · kb · kb bulk · traces
 │                                       cache · prefs · scheduler · health
 │
-├── tests/                              597 tests · 14 test files · autouse LLM mock
+├── tests/                              644 tests · 15 test files · autouse LLM mock
 │   ├── conftest.py
 │   ├── test_agents.py                  (19)
 │   ├── test_advanced_modules.py        (34)
 │   ├── test_api.py                     (21)
 │   ├── test_chat_agent.py              (33)
 │   ├── test_document_processing.py     (15)
+│   ├── test_embedding_backends.py      (47)
 │   ├── test_final_modules.py           (25)
 │   ├── test_financial_agent.py         (56)
 │   ├── test_integration.py             (10)

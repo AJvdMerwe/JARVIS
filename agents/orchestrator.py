@@ -38,7 +38,7 @@ Architecture:
 
 Fallback chains (per intent, highest priority first):
   DOCUMENT  →  SEARCH  →  CHAT
-  SEARCH    →  DOCUMENT  →  CHAT
+  SEARCH    →  DOCUMENT →  CHAT
   NEWS      →  SEARCH  →  CHAT
   FINANCE   →  SEARCH  →  CHAT
   CODE      →  SEARCH  →  CHAT

@@ -41,7 +41,7 @@ bash start.sh --help                                   # all options
 bash start.sh voice                                    # mic + TTS
 bash start.sh api                                      # FastAPI server on :8080
 bash start.sh docker                                   # full Docker Compose stack
-bash start.sh test                                     # run the 644-test suite
+bash start.sh test                                     # run the 693-test suite
 bash start.sh --query "Explain recursion like I'm five"
 bash start.sh --ingest ./reports/
 bash start.sh --model llama3.2:3b                      # lighter model
@@ -56,6 +56,7 @@ bash start.sh --backend vllm api                       # GPU + API server
 |---|---|
 | **6 specialist agents** | Chat · Code · News · Search · Document · Finance — auto-routed by intent |
 | **Fallback loop** | If the primary agent fails, the orchestrator tries fallback agents then synthesises |
+| **RAG pre-check** | Vector-store scan after intent detection; serves KB answers instantly, skipping agents |
 | **Direct LLM chat** | ChatAgent talks straight to the model with full conversation history |
 | **Document Q&A** | Ingest PDF, DOCX, XLSX, PPTX, TXT, MD, CSV, HTML, JSON, XML |
 | **Mass document upload** | Concurrent batch ingestion with type detection, deduplication, and dry-run |
@@ -85,51 +86,51 @@ bash start.sh --backend vllm api                       # GPU + API server
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
 │                            Interfaces                                    │
-│   CLI (Typer)  ·  Interactive REPL  ·  Voice loop  ·  Web UI           │
-│   FastAPI REST ·  WebSocket /ws     ·  SSE /stream  ·  OpenAPI /docs   │
+│   CLI (Typer)  ·  Interactive REPL  ·  Voice loop  ·  Web UI             │
+│   FastAPI REST ·  WebSocket /ws     ·  SSE /stream  ·  OpenAPI /docs     │
 └───────────────────────────────┬──────────────────────────────────────────┘
                                 │
 ┌───────────────────────────────▼──────────────────────────────────────────┐
 │                           Orchestrator                                   │
 │                                                                          │
 │  Intent Router (2-stage)                                                 │
-│    Stage 1: keyword regex + phrase patterns    < 1ms, no LLM call       │
+│    Stage 1: keyword regex + phrase patterns    < 1ms, no LLM call        │
 │    Stage 2: LLM classification                 ambiguous queries only    │
 │                                                                          │
-│  ┌──────┬──────┬──────┬──────────┬──────────┬──────────┐               │
-│  │ Chat │ Code │ News │  Search  │ Document │ Finance  │               │
-│  │Agent │Agent │Agent │  Agent   │  Agent   │  Agent   │               │
-│  └──────┴──────┴──────┴──────────┴──────────┴──────────┘               │
+│  ┌──────┬──────┬──────┬──────────┬──────────┬──────────┐                 │
+│  │ Chat │ Code │ News │  Search  │ Document │ Finance  │                 │
+│  │Agent │Agent │Agent │  Agent   │  Agent   │  Agent   │                 │
+│  └──────┴──────┴──────┴──────────┴──────────┴──────────┘                 │
 │                                                                          │
-│  Quality gate → fallback chain → synthesis (when needed)                │
-│  Post-processing: memory · episodic · summariser · tracing              │
+│  RAG pre-check → quality gate → fallback chain → synthesis               │
+│  Post-processing: memory · episodic · summariser · tracing               │
 └──────────────────────────────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────────────────────────┐
 │                             Core Layer                                   │
 │                                                                          │
-│  llm_manager       Ollama / vLLM factory · @lru_cache singleton         │
-│  resilience        ResilientLLM · CircuitBreaker · retry + failover     │
-│  memory            ConversationMemory · PersistentMemory (JSON)         │
-│  summariser        ConversationSummariser (rolling LLM compression)     │
-│  long_term_memory  EpisodicMemory (ChromaDB, cross-session recall)      │
-│  async_runner      AsyncAgentRunner · fan-out · streaming callbacks     │
-│  cache             ToolCache (TTL, LRU, disk) · @cached_tool            │
-│  tracing           Tracer · Span · TraceStore (JSONL sink)              │
-│  user_prefs        UserPreferences (Pydantic, per-user JSON)            │
-│  scheduler         TaskScheduler (daemon thread, 4 built-in tasks)      │
-│  logging           JsonFormatter · AssistantLogger · agent_call()       │
-│  voice             Whisper STT · MicrophoneListener VAD · pyttsx3 TTS   │
+│  llm_manager       Ollama / vLLM factory · @lru_cache singleton          │
+│  resilience        ResilientLLM · CircuitBreaker · retry + failover      │ 
+│  memory            ConversationMemory · PersistentMemory (JSON)          │
+│  summariser        ConversationSummariser (rolling LLM compression)      │
+│  long_term_memory  EpisodicMemory (ChromaDB, cross-session recall)       │
+│  async_runner      AsyncAgentRunner · fan-out · streaming callbacks      │
+│  cache             ToolCache (TTL, LRU, disk) · @cached_tool             │
+│  tracing           Tracer · Span · TraceStore (JSONL sink)               │
+│  user_prefs        UserPreferences (Pydantic, per-user JSON)             │
+│  scheduler         TaskScheduler (daemon thread, 4 built-in tasks)       │
+│  logging           JsonFormatter · AssistantLogger · agent_call()        │
+│  voice             Whisper STT · MicrophoneListener VAD · pyttsx3 TTS    │
 └──────────────────────────────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────────────────────────┐
 │                       Document Processing                                │
 │                                                                          │
-│  TypeDetector      12 types · 17 extensions · magic-byte sniffing       │
-│  DoclingProcessor  PDF/DOCX/XLSX/PPTX → DocumentChunk with references   │
-│  MassUploader      concurrent batch · dedup · dry-run · progress hooks  │
-│  DocumentManager   search · stats · delete · LangChain retriever        │
-│  VectorStore       ChromaDB · cosine similarity · idempotent ingest     │
+│  TypeDetector      12 types · 17 extensions · magic-byte sniffing        │
+│  DoclingProcessor  PDF/DOCX/XLSX/PPTX → DocumentChunk with references    │
+│  MassUploader      concurrent batch · dedup · dry-run · progress hooks   │
+│  DocumentManager   search · stats · delete · LangChain retriever         │
+│  VectorStore       ChromaDB · cosine similarity · idempotent ingest      │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -206,6 +207,87 @@ Eight task types with direct tool routing (no ReAct loop for known patterns):
 Company names resolve to tickers automatically: `"Apple"` → `AAPL`, `"Microsoft"` → `MSFT`, `"Bitcoin"` → `BTC-USD` (70+ entries in the lookup map). Data comes from Yahoo Finance via yfinance; the LLM's training knowledge is used as a fallback when the network is restricted.
 
 ---
+
+## RAG Pre-check
+
+After intent is detected and before any agent is invoked, the orchestrator runs a
+lightweight vector-store scan to check whether the knowledge base already contains
+a sufficient answer. When it does, the answer is returned immediately — no agent
+is ever called.
+
+```
+intent detected
+      │
+      ▼
+RAG pre-check  ──► search KB (< 200 ms)
+      │
+      ├── relevant chunks found + LLM answers from context
+      │       └── SUFFICIENT ──────────────────────────► return KB answer
+      │
+      └── no relevant chunks  /  LLM says INSUFFICIENT
+              └────────────────────────────────────────► primary agent
+```
+
+### How it works
+
+1. **Skip check** — CODE and CHAT intents are bypassed immediately (not retrieval tasks).
+   Empty knowledge bases are also skipped with zero latency.
+2. **Similarity search** — `DocumentManager.search()` is called with the user query.
+   Only chunks above `rag_similarity_threshold` (default `0.55`) are kept.
+3. **Strict LLM prompt** — the model is given only the retrieved excerpts and asked to
+   answer or return the single word `INSUFFICIENT`.
+4. **Quality gate** — the same `_is_sufficient_response()` check used by the fallback
+   loop validates the answer before returning it.
+5. **Fall-through** — if any step fails (empty KB, low scores, INSUFFICIENT verdict,
+   LLM error), execution continues to the normal agent routing without interruption.
+
+### Response shape
+
+A RAG pre-check answer is a standard `AgentResponse` with:
+
+```python
+AgentResponse(
+    output    = "Q3 revenue was $4.2B according to Q3 Report…",
+    agent_name= "rag_precheck",
+    references= ["Q3 Report › Page 4 › Revenue Summary"],
+    metadata  = {
+        "rag_chunks":    3,      # number of chunks retrieved
+        "rag_top_score": 0.87,   # highest cosine similarity
+        "rag_elapsed_ms": 143.2, # total pre-check time
+    },
+)
+```
+
+### Configuration
+
+```python
+from agents.orchestrator import Orchestrator
+
+# Default: pre-check enabled, threshold 0.55, retrieve 4 chunks
+orch = Orchestrator(
+    enable_rag_precheck      = True,
+    rag_similarity_threshold = 0.55,   # 0.65+ = more selective
+    rag_k                    = 4,      # chunks to retrieve
+)
+
+# Disable for deterministic / unit-test pipelines
+orch = Orchestrator(enable_rag_precheck=False)
+
+# More aggressive retrieval for deep knowledge bases
+orch = Orchestrator(rag_similarity_threshold=0.45, rag_k=8)
+```
+
+### Intents that participate
+
+| Intent | Pre-check runs? | Reason |
+|---|---|---|
+| `DOCUMENT` | ✓ | Core retrieval use-case |
+| `SEARCH` | ✓ | KB may hold the factual answer |
+| `NEWS` | ✓ | Ingested news articles searched first |
+| `FINANCE` | ✓ | Financial reports in KB checked first |
+| `UNKNOWN` | ✓ | Best-effort KB scan |
+| `CHAT` | ✗ | Conversational, not retrieval |
+| `CODE` | ✗ | Code generation is not a lookup task |
 
 ## Orchestrator — Fallback Loop
 
@@ -365,7 +447,7 @@ Modes
   voice     REPL with Whisper STT + TTS
   api       FastAPI server on :8080
   docker    Full Docker Compose stack
-  test      Run the 644-test suite
+  test      Run the 693-test suite
 
 Options
   --query  TEXT   Single query, print response, exit
@@ -551,7 +633,6 @@ Response:
 
 ---
 
-
 ## Embedding Backends
 
 The assistant supports two embedding backends, selectable via `EMBEDDING_BACKEND` in `.env`.
@@ -711,7 +792,7 @@ docker compose run -it --rm assistant
 
 ```bash
 make install-dev    # venv + all deps + dev extras
-make test           # 644 tests
+make test           # 693 tests
 make test-cov       # with HTML coverage → data/coverage/
 make test-unit      # unit tests only
 make test-api       # API tests only
@@ -743,8 +824,10 @@ virtual-assistant/
 │   ├── search_agent.py                 4-route: math/URL/encyclopedic/multi-source
 │   ├── document_agent.py               7 tools: ingest, bulk ingest, search, manage
 │   ├── financial_agent.py              8-task router, company-name resolution, yfinance
+│   ├── rag_precheck.py                 KB scan before agents; returns RAG answer or None
 │   └── orchestrator.py                 Intent enum · 2-stage routing · fallback loop
-│                                       quality gates · synthesis · LangGraph graph
+│                                       RAG pre-check · quality gates · synthesis
+│                                       fallback chains · LangGraph graph
 │
 ├── core/
 │   ├── llm_manager.py                  Ollama / vLLM factory + @lru_cache singleton
@@ -803,7 +886,7 @@ virtual-assistant/
 │   └── admin_cli.py                    sessions · kb · kb bulk · traces
 │                                       cache · prefs · scheduler · health
 │
-├── tests/                              644 tests · 15 test files · autouse LLM mock
+├── tests/                              693 tests · 16 test files · autouse LLM mock
 │   ├── conftest.py
 │   ├── test_agents.py                  (19)
 │   ├── test_advanced_modules.py        (34)
@@ -817,6 +900,7 @@ virtual-assistant/
 │   ├── test_mass_uploader.py           (127)
 │   ├── test_new_modules.py             (41)
 │   ├── test_orchestrator.py            (86)
+│   ├── test_rag_precheck.py            (49)
 │   ├── test_rate_limiter.py            (18)
 │   ├── test_tools.py                   (23)
 │   └── test_voice.py                   (4)

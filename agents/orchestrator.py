@@ -11,13 +11,13 @@ Architecture:
   │  User Input                                                             │
   │      │                                                                  │
   │      ▼                                                                  │
-  │  Intent Router  ──► keyword heuristics (fast, no LLM)                   │
+  │  Intent Router  ──► keyword heuristics (fast, no LLM)                  │
   │      │          └──► LLM classifier    (fallback for ambiguous queries) │
   │      │                                                                  │
   │      ▼                                                                  │
-  │  RAG Pre-check  ──► vector-store scan (fast, < 200 ms)                  │
-  │      │          ├──► SUFFICIENT ──► post-process & return               │
-  │      │          └──► INSUFFICIENT / SKIP ──► Primary Agent              │
+  │  RAG Pre-check  ──► vector-store scan (fast, < 200 ms)                 │
+  │      │          ├──► SUFFICIENT ──► post-process & return              │
+  │      │          └──► INSUFFICIENT / SKIP ──► Primary Agent             │
   │      │                                                                  │
   │      ▼                                                                  │
   │  Primary Agent (chosen by intent)                                       │
@@ -25,20 +25,20 @@ Architecture:
   │      ▼                                                                  │
   │  Response Quality Check                                                 │
   │      │                                                                  │
-  │      ├── SUFFICIENT ──► Post-process & return                           │
+  │      ├── SUFFICIENT ──► Post-process & return                          │
   │      │                                                                  │
-  │      └── INSUFFICIENT ──► Fallback Chain                                │
+  │      └── INSUFFICIENT ──► Fallback Chain                               │
   │               │                                                         │
-  │               ├── Fallback Agent 1 → quality check → ...                │
-  │               ├── Fallback Agent 2 → quality check → ...                │
-  │               └── Final synthesis (LLM merges best evidence)            │
+  │               ├── Fallback Agent 1 → quality check → ...               │
+  │               ├── Fallback Agent 2 → quality check → ...               │
+  │               └── Final synthesis (LLM merges best evidence)           │
   │                                                                         │
-  │  Post-processing (memory · episodic · summariser · tracing)             │
+  │  Post-processing (memory · episodic · summariser · tracing)            │
   └─────────────────────────────────────────────────────────────────────────┘
 
 Fallback chains (per intent, highest priority first):
   DOCUMENT  →  SEARCH  →  CHAT
-  SEARCH    →  DOCUMENT →  CHAT
+  SEARCH    →  DOCUMENT  →  CHAT
   NEWS      →  SEARCH  →  CHAT
   FINANCE   →  SEARCH  →  CHAT
   CODE      →  SEARCH  →  CHAT
@@ -67,6 +67,7 @@ from typing import Any, Optional, TypedDict
 from .base_agent import AgentResponse, BaseAgent
 from .chat_agent import ChatAgent
 from .code_agent import CodeAgent
+from .deep_research_agent import DeepResearchAgent
 from .document_agent import DocumentAgent
 from .financial_agent import FinancialAgent
 from .news_agent import NewsAgent
@@ -90,6 +91,7 @@ class Intent(str, Enum):
     SEARCH   = "search"    # Web search, Wikipedia, calculations
     DOCUMENT = "document"  # KB / document Q&A
     FINANCE  = "finance"   # Stock quotes, financials, market analysis
+    RESEARCH = "research"  # Multi-turn deep research with reasoning model
     UNKNOWN  = "unknown"   # Unclassifiable — falls back to CHAT
 
 
@@ -172,6 +174,7 @@ _FALLBACK_CHAINS: dict[Intent, list[Intent]] = {
     Intent.NEWS:     [Intent.SEARCH, Intent.CHAT],
     Intent.FINANCE:  [Intent.SEARCH, Intent.CHAT],
     Intent.CODE:     [Intent.SEARCH, Intent.CHAT],
+    Intent.RESEARCH: [Intent.SEARCH, Intent.CHAT],
     Intent.CHAT:     [Intent.SEARCH],
     Intent.UNKNOWN:  [Intent.CHAT],
 }
@@ -263,20 +266,38 @@ _FINANCE_PHRASES = re.compile(
 )
 
 
+_RESEARCH_KEYWORDS = re.compile(
+    r"\b(deep research|deep dive|comprehensive report|in.?depth analysis|"
+    r"thoroughly (research|analyse|analyze|investigate|examine)|"
+    r"detailed (report|study|analysis|overview|examination)|"
+    r"literature (review|survey)|state of the art|"
+    r"research (the|into|on|about)|"
+    r"(what does|what do) (the )?(research|literature|science|studies) say|"
+    r"systematic review|meta.?analysis|"
+    r"investigate (the|thoroughly)|"
+    r"full (report|analysis|study)|"
+    r"everything (about|on)|tell me everything|"
+    r"academic overview|scholarly (review|analysis))\b",
+    re.IGNORECASE,
+)
+
+
 def _keyword_route(query: str) -> Optional[Intent]:
     """Stage-1 intent detector. Returns None when ambiguous."""
-    code_score    = len(_CODE_KEYWORDS.findall(query))
-    news_score    = len(_NEWS_KEYWORDS.findall(query))
-    doc_score     = len(_DOCUMENT_KEYWORDS.findall(query))
-    chat_score    = len(_CHAT_KEYWORDS.findall(query))
-    finance_score = len(_FINANCE_KEYWORDS.findall(query))
+    code_score     = len(_CODE_KEYWORDS.findall(query))
+    news_score     = len(_NEWS_KEYWORDS.findall(query))
+    doc_score      = len(_DOCUMENT_KEYWORDS.findall(query))
+    chat_score     = len(_CHAT_KEYWORDS.findall(query))
+    finance_score  = len(_FINANCE_KEYWORDS.findall(query))
     finance_score += len(_FINANCE_PHRASES.findall(query))
+    research_score = len(_RESEARCH_KEYWORDS.findall(query))
 
     specialist_scores: dict[Intent, int] = {
         Intent.CODE:     code_score,
         Intent.NEWS:     news_score,
         Intent.DOCUMENT: doc_score,
         Intent.FINANCE:  finance_score,
+        Intent.RESEARCH: research_score,
     }
     best_specialist, best_score = max(specialist_scores.items(), key=lambda x: x[1])
     second_best = sorted(specialist_scores.values(), reverse=True)[1]
@@ -426,8 +447,8 @@ def _llm_quality_check(query: str, response: AgentResponse) -> bool:
 
 
 def _synthesise_from_attempts(
-        query:    str,
-        attempts: list[tuple[str, AgentResponse]],
+    query:    str,
+    attempts: list[tuple[str, AgentResponse]],
 ) -> AgentResponse:
     """
     Ask the LLM to synthesise the best possible answer from all partial
@@ -564,19 +585,19 @@ class Orchestrator:
     """
 
     def __init__(
-            self,
-            session_id:                str   = "default",
-            enable_episodic:           bool  = False,
-            enable_summariser:         bool  = False,
-            enable_plugins:            bool  = True,
-            enable_scheduler:          bool  = False,
-            enable_llm_quality_check:  bool  = False,
-            enable_rag_precheck:       bool  = True,
-            rag_similarity_threshold:  float = 0.55,
-            rag_k:                     int   = 4,
-            max_fallback_attempts:     int   = 2,
-            summarise_after:           int   = 40,
-            recent_k:                  int   = 10,
+        self,
+        session_id:                str   = "default",
+        enable_episodic:           bool  = False,
+        enable_summariser:         bool  = False,
+        enable_plugins:            bool  = True,
+        enable_scheduler:          bool  = False,
+        enable_llm_quality_check:  bool  = False,
+        enable_rag_precheck:       bool  = True,
+        rag_similarity_threshold:  float = 0.55,
+        rag_k:                     int   = 4,
+        max_fallback_attempts:     int   = 2,
+        summarise_after:           int   = 40,
+        recent_k:                  int   = 10,
     ) -> None:
         self._session_id               = session_id
         self._enable_llm_quality_check = enable_llm_quality_check
@@ -594,6 +615,7 @@ class Orchestrator:
             Intent.SEARCH:   SearchAgent(memory=self._memory),
             Intent.DOCUMENT: DocumentAgent(memory=self._memory),
             Intent.FINANCE:  FinancialAgent(memory=self._memory),
+            Intent.RESEARCH: DeepResearchAgent(memory=self._memory),
         }
 
         self._summariser = None
@@ -753,12 +775,12 @@ class Orchestrator:
     # -------------------------------------------------------------------------
 
     def _run_fallback_chain(
-            self,
-            query:        str,
-            primary:      Intent,
-            attempts:     list[tuple[str, AgentResponse]],
-            max_attempts: int,
-            **kwargs: Any,
+        self,
+        query:        str,
+        primary:      Intent,
+        attempts:     list[tuple[str, AgentResponse]],
+        max_attempts: int,
+        **kwargs: Any,
     ) -> AgentResponse:
         """
         Iterate through the fallback chain for the given primary intent until
@@ -805,7 +827,7 @@ class Orchestrator:
                 "Fallback %d/%d: trying '%s' after '%s' failed for query: %s…",
                 fallbacks_run + 1, max_attempts,
                 fb_intent.value, primary.value, query[:60],
-                )
+            )
 
             fb_response = self._call_agent(fb_agent, query, **kwargs)
             attempts.append((fb_agent.name, fb_response))
@@ -862,9 +884,9 @@ class Orchestrator:
 
     @staticmethod
     def _call_agent(
-            agent: BaseAgent,
-            query: str,
-            **kwargs: Any,
+        agent: BaseAgent,
+        query: str,
+        **kwargs: Any,
     ) -> AgentResponse:
         """
         Call an agent and catch all exceptions, converting them into a
@@ -967,10 +989,10 @@ class Orchestrator:
         return await asyncio.to_thread(self.run, query, **kwargs)
 
     async def fanout(
-            self,
-            query:   str,
-            intents: list[Intent],
-            **kwargs: Any,
+        self,
+        query:   str,
+        intents: list[Intent],
+        **kwargs: Any,
     ) -> list[AgentResponse]:
         from core.async_runner import AsyncAgentRunner
         runner = AsyncAgentRunner()
@@ -1022,6 +1044,7 @@ class Orchestrator:
         graph.add_node("search",   _agent_node(Intent.SEARCH))
         graph.add_node("document", _agent_node(Intent.DOCUMENT))
         graph.add_node("finance",  _agent_node(Intent.FINANCE))
+        graph.add_node("research", _agent_node(Intent.RESEARCH))
 
         graph.set_entry_point("router")
         graph.add_conditional_edges(
@@ -1034,9 +1057,10 @@ class Orchestrator:
                 Intent.DOCUMENT.value: "document",
                 Intent.UNKNOWN.value:  "chat",
                 Intent.FINANCE.value:  "finance",
+                Intent.RESEARCH.value: "research",
             },
         )
-        for node in ("chat", "code", "news", "search", "document", "finance"):
+        for node in ("chat", "code", "news", "search", "document", "finance", "research"):
             graph.add_edge(node, END)
 
         return graph.compile()

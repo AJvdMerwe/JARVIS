@@ -24,6 +24,16 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "llama3.1:8b"
 
+    # Reasoning / thinking model used by DeepResearchAgent.
+    # Recommended: deepseek-r1:7b, deepseek-r1:14b, qwen3:8b
+    # Pull with: ollama pull deepseek-r1:7b
+    ollama_reasoning_model: str = "deepseek-r1:7b"
+
+    # Deep research configuration
+    research_max_iterations: int = Field(5, ge=1, le=20)
+    research_max_sources: int = Field(8, ge=2, le=30)
+    research_chunk_budget: int = Field(6000, ge=1000, le=20000)
+
     # ── vLLM ────────────────────────────────────────────────────────────────
     vllm_base_url: str = "http://localhost:8000/v1"
     vllm_model: str = "mistralai/Mistral-7B-Instruct-v0.2"

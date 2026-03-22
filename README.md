@@ -41,7 +41,7 @@ bash start.sh --help                                   # all options
 bash start.sh voice                                    # mic + TTS
 bash start.sh api                                      # FastAPI server on :8080
 bash start.sh docker                                   # full Docker Compose stack
-bash start.sh test                                     # run the 693-test suite
+bash start.sh test                                     # run the 781-test suite
 bash start.sh --query "Explain recursion like I'm five"
 bash start.sh --ingest ./reports/
 bash start.sh --model llama3.2:3b                      # lighter model
@@ -57,6 +57,7 @@ bash start.sh --backend vllm api                       # GPU + API server
 | **6 specialist agents** | Chat · Code · News · Search · Document · Finance — auto-routed by intent |
 | **Fallback loop** | If the primary agent fails, the orchestrator tries fallback agents then synthesises |
 | **RAG pre-check** | Vector-store scan after intent detection; serves KB answers instantly, skipping agents |
+| **Deep Research Agent** | Multi-turn reasoning-model pipeline: plan → gather → evaluate → synthesise |
 | **Direct LLM chat** | ChatAgent talks straight to the model with full conversation history |
 | **Document Q&A** | Ingest PDF, DOCX, XLSX, PPTX, TXT, MD, CSV, HTML, JSON, XML |
 | **Mass document upload** | Concurrent batch ingestion with type detection, deduplication, and dry-run |
@@ -86,51 +87,51 @@ bash start.sh --backend vllm api                       # GPU + API server
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
 │                            Interfaces                                    │
-│   CLI (Typer)  ·  Interactive REPL  ·  Voice loop  ·  Web UI             │
-│   FastAPI REST ·  WebSocket /ws     ·  SSE /stream  ·  OpenAPI /docs     │
+│   CLI (Typer)  ·  Interactive REPL  ·  Voice loop  ·  Web UI           │
+│   FastAPI REST ·  WebSocket /ws     ·  SSE /stream  ·  OpenAPI /docs   │
 └───────────────────────────────┬──────────────────────────────────────────┘
                                 │
 ┌───────────────────────────────▼──────────────────────────────────────────┐
 │                           Orchestrator                                   │
 │                                                                          │
 │  Intent Router (2-stage)                                                 │
-│    Stage 1: keyword regex + phrase patterns    < 1ms, no LLM call        │
+│    Stage 1: keyword regex + phrase patterns    < 1ms, no LLM call       │
 │    Stage 2: LLM classification                 ambiguous queries only    │
 │                                                                          │
-│  ┌──────┬──────┬──────┬──────────┬──────────┬──────────┐                 │
-│  │ Chat │ Code │ News │  Search  │ Document │ Finance  │                 │
-│  │Agent │Agent │Agent │  Agent   │  Agent   │  Agent   │                 │
-│  └──────┴──────┴──────┴──────────┴──────────┴──────────┘                 │
+│  ┌──────┬──────┬──────┬──────────┬──────────┬──────────┬──────────┐    │
+│  │ Chat │ Code │ News │  Search  │ Document │ Finance  │ Research │    │
+│  │Agent │Agent │Agent │  Agent   │  Agent   │  Agent   │  Agent   │    │
+│  └──────┴──────┴──────┴──────────┴──────────┴──────────┴──────────┘    │
 │                                                                          │
-│  RAG pre-check → quality gate → fallback chain → synthesis               │
-│  Post-processing: memory · episodic · summariser · tracing               │
+│  RAG pre-check → quality gate → fallback chain → synthesis              │
+│  Post-processing: memory · episodic · summariser · tracing              │
 └──────────────────────────────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────────────────────────┐
 │                             Core Layer                                   │
 │                                                                          │
-│  llm_manager       Ollama / vLLM factory · @lru_cache singleton          │
-│  resilience        ResilientLLM · CircuitBreaker · retry + failover      │ 
-│  memory            ConversationMemory · PersistentMemory (JSON)          │
-│  summariser        ConversationSummariser (rolling LLM compression)      │
-│  long_term_memory  EpisodicMemory (ChromaDB, cross-session recall)       │
-│  async_runner      AsyncAgentRunner · fan-out · streaming callbacks      │
-│  cache             ToolCache (TTL, LRU, disk) · @cached_tool             │
-│  tracing           Tracer · Span · TraceStore (JSONL sink)               │
-│  user_prefs        UserPreferences (Pydantic, per-user JSON)             │
-│  scheduler         TaskScheduler (daemon thread, 4 built-in tasks)       │
-│  logging           JsonFormatter · AssistantLogger · agent_call()        │
-│  voice             Whisper STT · MicrophoneListener VAD · pyttsx3 TTS    │
+│  llm_manager       Ollama / vLLM factory · @lru_cache singleton         │
+│  resilience        ResilientLLM · CircuitBreaker · retry + failover     │
+│  memory            ConversationMemory · PersistentMemory (JSON)         │
+│  summariser        ConversationSummariser (rolling LLM compression)     │
+│  long_term_memory  EpisodicMemory (ChromaDB, cross-session recall)      │
+│  async_runner      AsyncAgentRunner · fan-out · streaming callbacks     │
+│  cache             ToolCache (TTL, LRU, disk) · @cached_tool            │
+│  tracing           Tracer · Span · TraceStore (JSONL sink)              │
+│  user_prefs        UserPreferences (Pydantic, per-user JSON)            │
+│  scheduler         TaskScheduler (daemon thread, 4 built-in tasks)      │
+│  logging           JsonFormatter · AssistantLogger · agent_call()       │
+│  voice             Whisper STT · MicrophoneListener VAD · pyttsx3 TTS   │
 └──────────────────────────────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────────────────────────┐
 │                       Document Processing                                │
 │                                                                          │
-│  TypeDetector      12 types · 17 extensions · magic-byte sniffing        │
-│  DoclingProcessor  PDF/DOCX/XLSX/PPTX → DocumentChunk with references    │
-│  MassUploader      concurrent batch · dedup · dry-run · progress hooks   │
-│  DocumentManager   search · stats · delete · LangChain retriever         │
-│  VectorStore       ChromaDB · cosine similarity · idempotent ingest      │
+│  TypeDetector      12 types · 17 extensions · magic-byte sniffing       │
+│  DoclingProcessor  PDF/DOCX/XLSX/PPTX → DocumentChunk with references   │
+│  MassUploader      concurrent batch · dedup · dry-run · progress hooks  │
+│  DocumentManager   search · stats · delete · LangChain retriever        │
+│  VectorStore       ChromaDB · cosine similarity · idempotent ingest     │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -140,7 +141,7 @@ bash start.sh --backend vllm api                       # GPU + API server
 
 ### Intent Routing
 
-Two-stage pipeline — Stage 1 is regex (< 1 ms, no LLM call); Stage 2 calls the LLM only when Stage 1 is ambiguous:
+Seven specialist agents are available. Two-stage pipeline — Stage 1 is regex (< 1 ms, no LLM call); Stage 2 calls the LLM only when Stage 1 is ambiguous:
 
 ```
 "Hello, how are you?"             →  CHAT     (greeting keyword)
@@ -289,6 +290,114 @@ orch = Orchestrator(rag_similarity_threshold=0.45, rag_k=8)
 | `CHAT` | ✗ | Conversational, not retrieval |
 | `CODE` | ✗ | Code generation is not a lookup task |
 
+## Deep Research Agent
+
+A multi-turn research pipeline that uses a **reasoning model** (default: `deepseek-r1:7b`)
+to produce a comprehensive, cited Markdown report for any topic.
+
+### Pipeline
+
+```
+query
+  │
+  ▼
+① Plan        reasoning model decomposes into sub-questions + initial search queries
+  │
+  ▼
+② Gather      web search + Wikipedia for each query (concurrent, up to max_sources)
+  │
+  ▼
+③ Evaluate    reasoning model: "Is evidence sufficient?" → SUFFICIENT or NEED_MORE: <query>
+  │
+  ├── SUFFICIENT ──► continue to Synthesise
+  │
+  └── NEED_MORE ──► run targeted search, loop back to Evaluate
+        (max_iterations cap prevents infinite loops)
+  │
+  ▼
+④ Synthesise  reasoning model writes structured Markdown report with inline citations
+```
+
+### Trigger queries
+
+The orchestrator routes to the Deep Research Agent when it detects research intent:
+
+```
+"Research the history of artificial intelligence"       →  RESEARCH
+"Deep dive into quantum computing"                      →  RESEARCH
+"Comprehensive report on climate change"                →  RESEARCH
+"Thoroughly analyse the causes of World War I"          →  RESEARCH
+"Literature review on CRISPR gene editing"              →  RESEARCH
+"Tell me everything about the Roman Empire"             →  RESEARCH
+"In-depth analysis of renewable energy"                 →  RESEARCH
+```
+
+Use `:agent research` in the REPL to force routing to this agent.
+
+### Setup
+
+Pull a reasoning model before use:
+
+```bash
+# Fast, 7B — good default
+ollama pull deepseek-r1:7b
+
+# Higher quality, more VRAM
+ollama pull deepseek-r1:14b
+ollama pull qwen3:14b
+```
+
+Then set in `.env`:
+
+```bash
+OLLAMA_REASONING_MODEL=deepseek-r1:7b
+RESEARCH_MAX_ITERATIONS=5   # evaluate cycles before giving up
+RESEARCH_MAX_SOURCES=8      # evidence items to collect
+RESEARCH_CHUNK_BUDGET=6000  # chars of evidence in synthesis prompt
+```
+
+### Response shape
+
+The agent returns a standard `AgentResponse`:
+
+```python
+AgentResponse(
+    output    = "# Research Report: Quantum Computing\n\n## Executive Summary…",
+    agent_name= "deep_research_agent",
+    references= ["https://…", "Wikipedia: Quantum computing", …],
+    metadata  = {
+        "iterations":    3,          # how many evaluate cycles ran
+        "sources_found": 7,          # evidence items gathered
+        "elapsed_s":     28.4,       # total wall-clock seconds
+        "model":         "deepseek-r1:7b",
+    },
+)
+```
+
+### How the reasoning model is used
+
+The reasoning model (`OLLAMA_REASONING_MODEL`) is called at three points:
+
+| Step | Purpose | Prompt style |
+|---|---|---|
+| Plan | Decompose query into sub-questions + search queries | JSON output |
+| Evaluate | Judge evidence sufficiency; emit NEED_MORE query | Single-word verdict |
+| Synthesise | Write the final Markdown report with citations | Long-form prose |
+
+The lighter chat model (`OLLAMA_MODEL`) is never used — all three calls go to the
+reasoning model so deliberate step-by-step thinking is applied throughout.
+
+`<think>…</think>` blocks emitted by deepseek-r1 and similar models are stripped
+automatically before further processing.
+
+### Fallback chain
+
+If the research agent fails or produces an insufficient answer:
+
+```
+RESEARCH → SEARCH → CHAT
+```
+
 ## Orchestrator — Fallback Loop
 
 When the primary agent does not produce a satisfactory answer, the orchestrator automatically iterates through a per-intent fallback chain until a sufficient response is found or all options are exhausted.
@@ -387,6 +496,19 @@ curl -X POST "http://localhost:8080/documents/bulk-ingest?directory=./reports/"
 > Index all files in the ./quarterly_reports/ directory
 ```
 
+### Concurrency model — split-lane processing
+
+Files are partitioned into two lanes based on their extraction strategy:
+
+| Lane | File types | Concurrency | Reason |
+|---|---|---|---|
+| **Sequential** | PDF · DOCX · XLSX · PPTX | 1 at a time | pypdfium2 is not thread-safe; running in parallel causes `"pdfium library is destroyed"` errors and memory leaks |
+| **Parallel** | TXT · MD · CSV · HTML · JSON · XML | `max_workers` threads | Pure-Python readers with no shared C-library state |
+
+Each Docling/pdfium file gets its own fresh `DoclingProcessor` instance that is explicitly `del`-ed and `gc.collect()`-ed before the next file starts, guaranteeing complete pdfium resource cleanup.
+
+`max_workers` applies only to the parallel lane. The sequential lane always runs in the main thread.
+
 ### Type detection
 
 Every file is classified before parsing. Two-stage detection: extension-first (fast), then magic-byte content sniffing for files with wrong or missing extensions.
@@ -431,6 +553,13 @@ print(report.summary())
 # report.total_chunks_added
 # report.total_elapsed_ms
 # report.outcomes          — list[FileOutcome] with per-file detail
+
+# Capacity planning:
+# max_workers only affects the TEXT/STRUCTURED parallel lane.
+# PDF/DOCX/XLSX/PPTX are always processed sequentially (pdfium safety).
+uploader = MassUploader(max_workers=1)   # minimal VRAM (safe default)
+uploader = MassUploader(max_workers=4)   # good for mixed batches
+uploader = MassUploader(max_workers=8)   # text-heavy batches on 8+ cores
 ```
 
 ---
@@ -447,7 +576,7 @@ Modes
   voice     REPL with Whisper STT + TTS
   api       FastAPI server on :8080
   docker    Full Docker Compose stack
-  test      Run the 693-test suite
+  test      Run the 781-test suite
 
 Options
   --query  TEXT   Single query, print response, exit
@@ -603,6 +732,10 @@ Response:
 |---|---|---|
 | `LLM_BACKEND` | `ollama` | `ollama` or `vllm` |
 | `OLLAMA_MODEL` | `llama3.1:8b` | Chat model |
+| `OLLAMA_REASONING_MODEL` | `deepseek-r1:7b` | Reasoning model (DeepResearchAgent) |
+| `RESEARCH_MAX_ITERATIONS` | `5` | Max gather→evaluate cycles |
+| `RESEARCH_MAX_SOURCES` | `8` | Max evidence items collected |
+| `RESEARCH_CHUNK_BUDGET` | `6000` | Max chars of evidence in synthesis prompt |
 | `OLLAMA_EMBEDDING_MODEL` | `nomic-embed-text` | Embedding model |
 | `VLLM_BASE_URL` | `http://localhost:8000/v1` | vLLM server URL |
 | `VOICE_ENABLED` | `false` | Enable mic + TTS |
@@ -792,7 +925,7 @@ docker compose run -it --rm assistant
 
 ```bash
 make install-dev    # venv + all deps + dev extras
-make test           # 693 tests
+make test           # 781 tests
 make test-cov       # with HTML coverage → data/coverage/
 make test-unit      # unit tests only
 make test-api       # API tests only
@@ -824,10 +957,12 @@ virtual-assistant/
 │   ├── search_agent.py                 4-route: math/URL/encyclopedic/multi-source
 │   ├── document_agent.py               7 tools: ingest, bulk ingest, search, manage
 │   ├── financial_agent.py              8-task router, company-name resolution, yfinance
+│   ├── deep_research_agent.py          plan→gather→evaluate→synthesise multi-turn loop
 │   ├── rag_precheck.py                 KB scan before agents; returns RAG answer or None
 │   └── orchestrator.py                 Intent enum · 2-stage routing · fallback loop
 │                                       RAG pre-check · quality gates · synthesis
 │                                       fallback chains · LangGraph graph
+│                                       RESEARCH intent → DeepResearchAgent
 │
 ├── core/
 │   ├── llm_manager.py                  Ollama / vLLM factory + @lru_cache singleton
@@ -886,18 +1021,19 @@ virtual-assistant/
 │   └── admin_cli.py                    sessions · kb · kb bulk · traces
 │                                       cache · prefs · scheduler · health
 │
-├── tests/                              693 tests · 16 test files · autouse LLM mock
+├── tests/                              781 tests · 17 test files · autouse LLM mock
 │   ├── conftest.py
 │   ├── test_agents.py                  (19)
 │   ├── test_advanced_modules.py        (34)
 │   ├── test_api.py                     (21)
 │   ├── test_chat_agent.py              (33)
+│   ├── test_deep_research_agent.py     (72)
 │   ├── test_document_processing.py     (15)
 │   ├── test_embedding_backends.py      (47)
 │   ├── test_final_modules.py           (25)
 │   ├── test_financial_agent.py         (56)
 │   ├── test_integration.py             (10)
-│   ├── test_mass_uploader.py           (127)
+│   ├── test_mass_uploader.py           (143)
 │   ├── test_new_modules.py             (41)
 │   ├── test_orchestrator.py            (86)
 │   ├── test_rag_precheck.py            (49)

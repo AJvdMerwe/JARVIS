@@ -95,6 +95,51 @@ def get_llm() -> BaseChatModel:
 
 
 @lru_cache(maxsize=1)
+def get_reasoning_llm() -> BaseChatModel:
+    """
+    Return a cached Ollama-backed LLM configured for the reasoning/thinking model.
+
+    This is a separate singleton from ``get_llm()`` so DeepResearchAgent can use
+    a large reasoning model (e.g. ``deepseek-r1:14b``, ``qwen3:8b``) while the
+    rest of the system continues using the lighter chat model.
+
+    Configured via:
+        OLLAMA_REASONING_MODEL=deepseek-r1:7b   (default)
+        OLLAMA_BASE_URL=http://localhost:11434
+
+    Recommended models (pull with ``ollama pull <model>``):
+        deepseek-r1:7b   — 7B, fast, strong reasoning
+        deepseek-r1:14b  — 14B, better quality, more VRAM
+        qwen3:8b         — 8B, competitive quality
+        qwen3:14b        — 14B, high quality
+
+    Returns
+    -------
+    BaseChatModel
+        Cached Ollama chat model for structured reasoning tasks.
+    """
+    try:
+        from langchain_ollama import ChatOllama  # type: ignore[import]
+    except ImportError as exc:
+        raise ImportError(
+            "langchain-ollama is not installed. Run: pip install langchain-ollama"
+        ) from exc
+
+    logger.info(
+        "Reasoning LLM → Ollama | model=%s | url=%s",
+        settings.ollama_reasoning_model,
+        settings.ollama_base_url,
+    )
+    return ChatOllama(
+        base_url=settings.ollama_base_url,
+        model=settings.ollama_reasoning_model,
+        temperature=0.1,         # low temperature for factual reasoning
+        num_predict=4096,        # generous output budget for long analyses
+        num_ctx=8192,            # large context window for multi-source synthesis
+    )
+
+
+@lru_cache(maxsize=1)
 def get_embeddings():
     """
     Return a cached LangChain embeddings model for the configured backend.

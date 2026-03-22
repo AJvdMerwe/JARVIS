@@ -7,18 +7,47 @@ Orchestrates bulk ingestion of documents from files or directories,
 applying type-appropriate extraction, chunking, and embedding, then
 storing results in the vector store for retrieval-augmented generation.
 
-Features
-────────
-  • Auto-detects document type and selects the optimal extraction strategy
-    (Docling → pure-Python fallback → plain-text) per file.
-  • Concurrent processing via a thread pool — configurable worker count.
-  • Content-hash deduplication — re-uploading the same file is a no-op.
+Concurrency model — split-lane processing
+──────────────────────────────────────────
+  DOCLING / FALLBACK lane  (PDF, DOCX, XLSX, PPTX)
+    Processed **sequentially** in document order.
+
+    Why: pypdfium2 (used by Docling for PDF rendering) is NOT thread-safe.
+    Its global C library state is destroyed when the first worker thread
+    exits, causing the error:
+        "Cannot close object; pdfium library is destroyed.
+         This may cause a memory leak."
+    Running these files one at a time eliminates the race condition while
+    keeping the pipeline deterministic and leak-free.
+
+    Each file gets its own fresh DoclingProcessor / DocumentConverter
+    instance that is fully garbage-collected before the next file starts,
+    ensuring complete pdfium resource cleanup.
+
+  TEXT / STRUCTURED lane  (TXT, MD, CSV, HTML, JSON, XML)
+    Processed **concurrently** via a ThreadPoolExecutor.
+
+    These formats use only pure-Python readers (no pdfium, no C extensions),
+    so parallel execution is safe and significantly speeds up large batches.
+
+Capacity planning
+─────────────────
+  max_workers is applied to the text/structured lane only.
+  The Docling lane always uses 1 worker (sequential).
+
+  Recommended settings:
+    max_workers=1  — minimal VRAM / RAM (default safe mode)
+    max_workers=4  — good for CPU-bound text batches on 4+ cores
+    max_workers=8  — high-throughput text-only ingestion
+
+Other features
+──────────────
+  • Auto-detects document type and selects the optimal extraction strategy.
+  • Content-hash (SHA-256) deduplication — re-uploading the same file is a no-op.
   • Per-file and batch-level progress callbacks (hook-friendly for UIs).
   • Rich UploadReport with per-file outcomes, timing, and summary stats.
   • Graceful error isolation — one bad file never aborts the whole batch.
   • Optional dry-run mode — detects and plans without writing to the store.
-  • Text file support (TXT, MD, CSV, HTML, JSON, XML) in addition to the
-    existing PDF/DOCX/XLSX/PPTX formats.
 
 Usage::
 
@@ -59,6 +88,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .document_manager import DocumentManager, IngestResult
+from .docling_processor import DoclingProcessor as _DoclingProcessor
 from .type_detector import (
     DocumentType,
     DocumentTypeInfo,
@@ -472,44 +502,138 @@ class MassUploader:
     #  Internal processing
     # =========================================================================
 
+    # ── Strategies that MUST be processed sequentially ─────────────────────────
+    # pdfium (used by Docling for PDF rendering) is NOT thread-safe.
+    # Running DOCLING/FALLBACK files in parallel threads causes:
+    #   "Cannot close object; pdfium library is destroyed."
+    # These strategies are always processed one-at-a-time.
+    _SEQUENTIAL_STRATEGIES: frozenset = frozenset({
+        ExtractionStrategy.DOCLING,
+        ExtractionStrategy.FALLBACK,
+    })
+
     def _process_batch(
         self,
         paths:   list[Path],
         dry_run: bool,
     ) -> list[FileOutcome]:
         """
-        Process a list of paths concurrently using a thread pool.
+        Split-lane batch processor.
 
-        Returns outcomes in the SAME ORDER as the input paths,
-        regardless of completion order.
+        Files are classified by strategy before any work begins:
+
+          Sequential lane  (DOCLING / FALLBACK — PDF, DOCX, XLSX, PPTX)
+            Processed one at a time to avoid pdfium thread-safety issues.
+            A fresh DoclingProcessor / DocumentConverter is created per file
+            and fully garbage-collected before the next file starts.
+
+          Parallel lane  (TEXT / STRUCTURED — TXT, MD, CSV, HTML, JSON, XML)
+            Processed concurrently using a ThreadPoolExecutor with
+            ``self._max_workers`` workers.  These use only pure-Python
+            readers with no shared C-library state.
+
+        The final output list preserves the original input order regardless
+        of which lane processed each file.
+
+        Parameters
+        ----------
+        paths : list[Path]
+        dry_run : bool
+
+        Returns
+        -------
+        list[FileOutcome]
+            One entry per input path, in the same order.
         """
+        if not paths:
+            return []
+
         total    = len(paths)
-        outcomes = [None] * total           # type: ignore[assignment]
+        outcomes: list[FileOutcome | None] = [None] * total
         done     = 0
 
-        with ThreadPoolExecutor(max_workers=self._max_workers) as pool:
-            # Submit all tasks, capturing original index
-            futures = {
-                pool.submit(self._process_one, p, dry_run): idx
-                for idx, p in enumerate(paths)
-            }
-            for future in as_completed(futures):
-                idx               = futures[future]
-                outcome           = future.result()       # never raises
-                outcomes[idx]     = outcome
-                done             += 1
+        def _record(idx: int, outcome: FileOutcome) -> None:
+            nonlocal done
+            outcomes[idx] = outcome
+            done += 1
+            if self._on_progress:
+                try:
+                    self._on_progress(outcome, done, total)
+                except Exception:
+                    pass
 
-                if self._on_progress:
-                    try:
-                        self._on_progress(outcome, done, total)
-                    except Exception:
-                        pass
+        # ── Phase 1: quick type detection for all paths ───────────────────────
+        # Only reads file headers — fast and safe to run up-front.
+        detections: list[tuple[int, Path, DocumentTypeInfo | None]] = []
+        for idx, path in enumerate(paths):
+            try:
+                info = self._detector.detect(path)
+            except Exception as exc:
+                outcome = FileOutcome(
+                    path=path,
+                    status="error",
+                    elapsed_ms=0.0,
+                    error=f"Detection failed: {exc}",
+                )
+                _record(idx, outcome)
+                info = None
+            detections.append((idx, path, info))
+
+        # Separate into sequential and parallel groups
+        seq_items:  list[tuple[int, Path, DocumentTypeInfo]] = []
+        par_items:  list[tuple[int, Path, DocumentTypeInfo]] = []
+
+        for idx, path, info in detections:
+            if info is None:
+                continue   # already recorded as error
+            if info.strategy in self._SEQUENTIAL_STRATEGIES:
+                seq_items.append((idx, path, info))
+            else:
+                par_items.append((idx, path, info))
+
+        logger.info(
+            "MassUploader split: %d sequential (Docling/pdfium) "
+            "+ %d parallel (text/structured).",
+            len(seq_items), len(par_items),
+        )
+
+        # ── Phase 2: sequential lane (pdfium-safe) ────────────────────────────
+        for idx, path, info in seq_items:
+            outcome = self._process_one(path, dry_run, pre_detected=info)
+            _record(idx, outcome)
+
+        # ── Phase 3: parallel lane (text/structured) ─────────────────────────
+        if par_items:
+            workers = min(self._max_workers, len(par_items))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                future_to_idx = {
+                    pool.submit(self._process_one, path, dry_run, info): idx
+                    for idx, path, info in par_items
+                }
+                for future in as_completed(future_to_idx):
+                    idx     = future_to_idx[future]
+                    outcome = future.result()   # never raises
+                    _record(idx, outcome)
 
         return [o for o in outcomes if o is not None]
 
-    def _process_one(self, path: Path, dry_run: bool) -> FileOutcome:
+    def _process_one(
+        self,
+        path:         Path,
+        dry_run:      bool,
+        pre_detected: "DocumentTypeInfo | None" = None,
+    ) -> FileOutcome:
         """
         Full pipeline for a single file: detect → deduplicate → ingest.
+
+        Parameters
+        ----------
+        path : Path
+        dry_run : bool
+        pre_detected : DocumentTypeInfo, optional
+            If the caller already ran type detection (e.g. _process_batch
+            pre-detects to partition into lanes), pass the result here to
+            skip a second detection call.
 
         All exceptions are caught; errors are captured in FileOutcome.error
         rather than propagated.
@@ -517,13 +641,16 @@ class MassUploader:
         t0 = time.monotonic()
 
         # ── Step 1: Detect type ───────────────────────────────────────────────
-        try:
-            info = self._detector.detect(path)
-        except Exception as exc:
-            return FileOutcome(
-                path=path, elapsed_ms=(time.monotonic() - t0) * 1000,
-                error=f"Detection failed: {exc}", status="error",
-            )
+        if pre_detected is not None:
+            info = pre_detected
+        else:
+            try:
+                info = self._detector.detect(path)
+            except Exception as exc:
+                return FileOutcome(
+                    path=path, elapsed_ms=(time.monotonic() - t0) * 1000,
+                    error=f"Detection failed: {exc}", status="error",
+                )
 
         # ── Step 2: Skip unsupported files ────────────────────────────────────
         if not info.is_supported:
@@ -614,14 +741,18 @@ class MassUploader:
         """
         Route to the correct ingestion path based on the detected strategy.
 
-        DOCLING / FALLBACK   → DocumentManager.ingest_with_result()
-                               (handles both — processor falls back internally)
-        TEXT                 → _ingest_text_file()
-        STRUCTURED           → _ingest_structured_file()
+        DOCLING / FALLBACK
+            Creates a **fresh** ``DoclingProcessor`` for each file and
+            explicitly deletes it after ingestion.  This ensures pdfium
+            objects are fully released before the next document is processed,
+            eliminating the "pdfium library is destroyed" memory leak.
+
+        TEXT       → _ingest_text_file()
+        STRUCTURED → _ingest_structured_file()
         """
         if info.strategy in (ExtractionStrategy.DOCLING,
                               ExtractionStrategy.FALLBACK):
-            return self._dm.ingest_with_result(path)
+            return self._ingest_docling_file(path)
 
         if info.strategy == ExtractionStrategy.TEXT:
             return self._ingest_text_file(path, info)
@@ -633,6 +764,77 @@ class MassUploader:
             filename=path.name,
             doc_title=path.stem.title(),
             error=f"No handler for strategy '{info.strategy.value}'",
+        )
+
+    def _ingest_docling_file(self, path: Path) -> IngestResult:
+        """
+        Ingest a PDF/DOCX/XLSX/PPTX file using a short-lived DoclingProcessor.
+
+        A fresh processor is instantiated for EACH file so that pdfium's
+        global C-library state is fully initialised and torn down within
+        the scope of a single call.  Explicit ``del`` + ``gc.collect()``
+        after processing guarantees pdfium objects are destroyed before
+        control returns to the caller (and before the next file starts on
+        the sequential lane).
+
+        This eliminates the race condition that produces:
+            "Cannot close object; pdfium library is destroyed."
+        """
+        import gc
+
+        t0        = time.monotonic()
+        processor = None
+        chunks    = []
+
+        try:
+            processor = _DoclingProcessor(
+                chunk_size=self._dm._processor.chunk_size,
+                chunk_overlap=self._dm._processor.chunk_overlap,
+            )
+            chunks = processor.process(path)
+        except Exception as exc:
+            logger.error("Docling processing failed for '%s': %s", path.name, exc)
+            return IngestResult(
+                filename=path.name,
+                doc_title=path.stem.title(),
+                error=str(exc),
+            )
+        finally:
+            # Explicit cleanup: release pdfium resources before returning
+            del processor
+            gc.collect()
+
+        if not chunks:
+            return IngestResult(
+                filename=path.name,
+                doc_title=path.stem.title(),
+                chunks_added=0,
+                chunks_total=0,
+            )
+
+        doc_title = chunks[0].doc_title if chunks else path.stem.title()
+
+        try:
+            added = self._dm._store.ingest(chunks)
+        except Exception as exc:
+            logger.error("Vector store ingest failed for '%s': %s", path.name, exc)
+            return IngestResult(
+                filename=path.name,
+                doc_title=doc_title,
+                error=str(exc),
+            )
+
+        elapsed_ms = (time.monotonic() - t0) * 1000
+        logger.info(
+            "Docling ingest '%s': %d new chunks in %.0fms.",
+            path.name, added, elapsed_ms,
+        )
+        return IngestResult(
+            filename=path.name,
+            doc_title=doc_title,
+            chunks_added=added,
+            chunks_total=len(chunks),
+            elapsed_ms=elapsed_ms,
         )
 
     def _ingest_text_file(

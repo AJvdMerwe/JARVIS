@@ -68,6 +68,7 @@ from .base_agent import AgentResponse, BaseAgent
 from .chat_agent import ChatAgent
 from .code_agent import CodeAgent
 from .data_analysis_agent import DataAnalysisAgent
+from .graphing_agent import GraphingAgent
 from .deep_research_agent import DeepResearchAgent
 from .document_agent import DocumentAgent
 from .financial_agent import FinancialAgent
@@ -95,6 +96,7 @@ class Intent(str, Enum):
     FINANCE  = "finance"   # Stock quotes, financials, market analysis
     RESEARCH = "research"  # Multi-turn deep research with reasoning model
     DATA     = "data"      # CSV / Excel analysis, pandas, charts
+    GRAPH    = "graph"     # Charts, plots, dashboards, data visualisation
     WRITING  = "writing"   # Long-form writing, articles, reports, DOCX export
     UNKNOWN  = "unknown"   # Unclassifiable — falls back to CHAT
 
@@ -180,6 +182,7 @@ _FALLBACK_CHAINS: dict[Intent, list[Intent]] = {
     Intent.CODE:     [Intent.SEARCH, Intent.CHAT],
     Intent.RESEARCH: [Intent.SEARCH, Intent.CHAT],
     Intent.DATA:     [Intent.CODE, Intent.CHAT],
+    Intent.GRAPH:    [Intent.DATA, Intent.CODE, Intent.CHAT],
     Intent.WRITING:  [Intent.CHAT],
     Intent.CHAT:     [Intent.SEARCH],
     Intent.UNKNOWN:  [Intent.CHAT],
@@ -287,6 +290,25 @@ _RESEARCH_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 
+
+_GRAPH_KEYWORDS = re.compile(
+    r"\b(bar chart|line chart|scatter plot|pie chart|histogram|heatmap|"
+    r"area chart|candlestick|waterfall|treemap|bubble chart|radar chart|"
+    r"box plot|violin plot|kde plot|density plot|correlation matrix|"
+    r"dashboard|multi.?panel|composite chart|"
+    r"plot (the|a|this|my|some|these)|"
+    r"chart (the|a|this|my)|"
+    r"graph (the|a|this|my|of)|"
+    r"visuali[sz]e|visuali[sz]ation|"
+    r"draw (a|the) (chart|graph|plot)|"
+    r"show (me )?(a |the )?(chart|graph|plot|visuali[sz]ation)|"
+    r"create (a |the )?(chart|graph|plot|dashboard)|"
+    r"generate (a |the )?(chart|graph|plot)|"
+    r"make (a |the )?(chart|graph|plot)|"
+    r"render (a |the )?(chart|graph|plot))\b",
+    re.IGNORECASE,
+)
+
 _DATA_KEYWORDS = re.compile(
     r"\b(csv|dataframe|dataset|spreadsheet|excel|tsv|"
     r"pandas|numpy|matplotlib|seaborn|plotly|"
@@ -332,6 +354,7 @@ def _keyword_route(query: str) -> Optional[Intent]:
     finance_score += len(_FINANCE_PHRASES.findall(query))
     research_score = len(_RESEARCH_KEYWORDS.findall(query))
     data_score     = len(_DATA_KEYWORDS.findall(query))
+    graph_score    = len(_GRAPH_KEYWORDS.findall(query))
     writing_score  = len(_WRITING_KEYWORDS.findall(query))
 
     specialist_scores: dict[Intent, int] = {
@@ -341,6 +364,7 @@ def _keyword_route(query: str) -> Optional[Intent]:
         Intent.FINANCE:  finance_score,
         Intent.RESEARCH: research_score,
         Intent.DATA:     data_score,
+        Intent.GRAPH:    graph_score,
         Intent.WRITING:  writing_score,
     }
     best_specialist, best_score = max(specialist_scores.items(), key=lambda x: x[1])
@@ -352,6 +376,30 @@ def _keyword_route(query: str) -> Optional[Intent]:
             and specialist_scores.get(Intent.DATA, 0) >= 1
             and _DATA_FILE_RE.search(query)):
         specialist_scores[Intent.DATA] += 1   # prefer DATA when data file clearly mentioned
+
+    # Tie-break: GRAPH beats DATA when an explicit chart-creation verb is present
+    _CHART_VERB_RE = re.compile(
+        r"\b(plot|chart|graph|visuali[sz]e|draw (a |the )?(chart|graph|plot)|"
+        r"show (me )?(a |the )?(chart|graph)|create (a |the )?(chart|graph)|"
+        r"make (a |the )?(chart|graph))\b",
+        re.IGNORECASE,
+    )
+    if (specialist_scores.get(Intent.GRAPH, 0) >= 1
+            and _CHART_VERB_RE.search(query)):
+        specialist_scores[Intent.GRAPH] += 1   # prefer GRAPH for explicit chart requests
+
+    # Additional boost: named chart types that are unambiguously visualisation requests
+    _NAMED_CHART_RE = re.compile(
+        r"\b(scatter plot|scatter chart|bar chart|line chart|pie chart|area chart|"
+        r"histogram|heatmap|heat map|correlation matrix|box plot|violin plot|"
+        r"kde plot|density plot|bubble chart|treemap|waterfall chart|"
+        r"candlestick|candlestick chart|gantt|dashboard|composite chart|"
+        r"multi.?panel|time.?series (chart|plot|graph)|"
+        r"visuali[sz]e|visuali[sz]ation)\b",
+        re.IGNORECASE,
+    )
+    if _NAMED_CHART_RE.search(query):
+        specialist_scores[Intent.GRAPH] = specialist_scores.get(Intent.GRAPH, 0) + 2
 
     # Tie-break: WRITING beats CHAT when writing-specific creation verbs are present
     _WRITE_VERB_RE = re.compile(
@@ -685,6 +733,7 @@ class Orchestrator:
             Intent.FINANCE:  FinancialAgent(memory=self._memory),
             Intent.RESEARCH: DeepResearchAgent(memory=self._memory),
             Intent.DATA:     DataAnalysisAgent(memory=self._memory),
+            Intent.GRAPH:    GraphingAgent(memory=self._memory),
             Intent.WRITING:  WritingAssistantAgent(memory=self._memory),
         }
 

@@ -52,7 +52,7 @@ _BANNER = """
 ╔══════════════════════════════════════════════════════════════════╗
 ║          Virtual Personal Assistant  v1.0                        ║
 ║  Chat · Code · News · Search · Docs · Finance · Research         ║
-║  Backend: {backend:<10}  Embed: {embed:<16}  Voice: {voice}     ║
+║  Backend: {backend:<10}  Embed: {embed:<16}  Voice: {voice}      ║
 ║  Type :help for commands  ·  :quit to exit                       ║
 ╚══════════════════════════════════════════════════════════════════╝
 """

@@ -67,12 +67,14 @@ from typing import Any, Optional, TypedDict
 from .base_agent import AgentResponse, BaseAgent
 from .chat_agent import ChatAgent
 from .code_agent import CodeAgent
+from .data_analysis_agent import DataAnalysisAgent
 from .deep_research_agent import DeepResearchAgent
 from .document_agent import DocumentAgent
 from .financial_agent import FinancialAgent
 from .news_agent import NewsAgent
 from .rag_precheck import rag_precheck
 from .search_agent import SearchAgent
+from .writing_agent import WritingAssistantAgent
 from core.memory import PersistentMemory
 from core.llm_manager import get_llm
 from config import settings
@@ -92,6 +94,8 @@ class Intent(str, Enum):
     DOCUMENT = "document"  # KB / document Q&A
     FINANCE  = "finance"   # Stock quotes, financials, market analysis
     RESEARCH = "research"  # Multi-turn deep research with reasoning model
+    DATA     = "data"      # CSV / Excel analysis, pandas, charts
+    WRITING  = "writing"   # Long-form writing, articles, reports, DOCX export
     UNKNOWN  = "unknown"   # Unclassifiable — falls back to CHAT
 
 
@@ -175,6 +179,8 @@ _FALLBACK_CHAINS: dict[Intent, list[Intent]] = {
     Intent.FINANCE:  [Intent.SEARCH, Intent.CHAT],
     Intent.CODE:     [Intent.SEARCH, Intent.CHAT],
     Intent.RESEARCH: [Intent.SEARCH, Intent.CHAT],
+    Intent.DATA:     [Intent.CODE, Intent.CHAT],
+    Intent.WRITING:  [Intent.CHAT],
     Intent.CHAT:     [Intent.SEARCH],
     Intent.UNKNOWN:  [Intent.CHAT],
 }
@@ -281,6 +287,40 @@ _RESEARCH_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 
+_DATA_KEYWORDS = re.compile(
+    r"\b(csv|dataframe|dataset|spreadsheet|excel|tsv|"
+    r"pandas|numpy|matplotlib|seaborn|plotly|"
+    r"correlation|distribution|regression|clustering|"
+    r"pivot.?table|group.?by|aggregate|"
+    r"outlier|anomal|trend|forecast|"
+    r"visuali[sz]e|visuali[sz]ation|plot|chart|graph|histogram|scatter|"
+    r"analyse (the |this |my )?data|analyze (the |this |my )?data|"
+    r"data analysis|statistical|statistics|"
+    r"load (the |this |my )?(file|data|csv|sheet)|"
+    r"what does (the |this |my )?data (show|say|mean)|"
+    r"average|mean|median|mode|standard deviation|variance|"
+    r"top (\d+ )?by|sum (of|by)|count (of|by))\b",
+    re.IGNORECASE,
+)
+
+_WRITING_KEYWORDS = re.compile(
+    r"\b(write (an?|the|a) (article|essay|report|blog|post|letter|email|document|"
+    r"piece|section|paragraph|draft|intro|conclusion|outline)|"
+    r"draft (an?|the|a) |"
+    r"compose (an?|the|a) |"
+    r"help me write|"
+    r"create (an?|the|a) (article|essay|report|blog|document|letter|email)|"
+    r"(write|create|generate) (an? )?(blog post|technical doc|white ?paper|case study)|"
+    r"outline (for|of|about)|"
+    r"long.?form|"
+    r"proofread|edit (my|this|the) (draft|essay|article|report|email|letter)|"
+    r"improve (my|this|the) writing|"
+    r"export (to |as )?(docx|word|markdown)|"
+    r"(formal|academic|professional) (writing|document|report)|"
+    r"letter to|email to)\b",
+    re.IGNORECASE,
+)
+
 
 def _keyword_route(query: str) -> Optional[Intent]:
     """Stage-1 intent detector. Returns None when ambiguous."""
@@ -291,6 +331,8 @@ def _keyword_route(query: str) -> Optional[Intent]:
     finance_score  = len(_FINANCE_KEYWORDS.findall(query))
     finance_score += len(_FINANCE_PHRASES.findall(query))
     research_score = len(_RESEARCH_KEYWORDS.findall(query))
+    data_score     = len(_DATA_KEYWORDS.findall(query))
+    writing_score  = len(_WRITING_KEYWORDS.findall(query))
 
     specialist_scores: dict[Intent, int] = {
         Intent.CODE:     code_score,
@@ -298,9 +340,35 @@ def _keyword_route(query: str) -> Optional[Intent]:
         Intent.DOCUMENT: doc_score,
         Intent.FINANCE:  finance_score,
         Intent.RESEARCH: research_score,
+        Intent.DATA:     data_score,
+        Intent.WRITING:  writing_score,
     }
     best_specialist, best_score = max(specialist_scores.items(), key=lambda x: x[1])
     second_best = sorted(specialist_scores.values(), reverse=True)[1]
+
+    # Tie-break: DATA beats DOCUMENT when the query mentions a data file type
+    _DATA_FILE_RE = re.compile(r"\b(csv|tsv|excel|\.xlsx?|spreadsheet|dataframe)\b", re.IGNORECASE)
+    if (specialist_scores.get(Intent.DATA, 0) == specialist_scores.get(Intent.DOCUMENT, 0)
+            and specialist_scores.get(Intent.DATA, 0) >= 1
+            and _DATA_FILE_RE.search(query)):
+        specialist_scores[Intent.DATA] += 1   # prefer DATA when data file clearly mentioned
+
+    # Tie-break: WRITING beats CHAT when writing-specific creation verbs are present
+    _WRITE_VERB_RE = re.compile(
+        r"\b(write|draft|compose|create|generate|produce)\s+(an?|the|a)\s+"
+        r"(article|essay|report|blog|post|letter|email|document|piece|outline)\b",
+        re.IGNORECASE,
+    )
+    if (specialist_scores.get(Intent.WRITING, 0) >= 1
+            and chat_score >= 1
+            and specialist_scores[Intent.WRITING] >= chat_score
+            and _WRITE_VERB_RE.search(query)):
+        specialist_scores[Intent.WRITING] += 1   # prefer WRITING over CHAT
+        chat_score = 0   # neutralise chat score for this query type
+
+    best_specialist, best_score = max(specialist_scores.items(), key=lambda x: x[1])
+    sorted_scores = sorted(specialist_scores.values(), reverse=True)
+    second_best   = sorted_scores[1] if len(sorted_scores) > 1 else 0
 
     if best_score >= 1 and best_score > second_best and chat_score < best_score:
         return best_specialist
@@ -587,7 +655,7 @@ class Orchestrator:
     def __init__(
         self,
         session_id:                str   = "default",
-        enable_episodic:           bool  = False,
+        enable_episodic:           bool  = True,   # on by default for long-term memory
         enable_summariser:         bool  = False,
         enable_plugins:            bool  = True,
         enable_scheduler:          bool  = False,
@@ -616,6 +684,8 @@ class Orchestrator:
             Intent.DOCUMENT: DocumentAgent(memory=self._memory),
             Intent.FINANCE:  FinancialAgent(memory=self._memory),
             Intent.RESEARCH: DeepResearchAgent(memory=self._memory),
+            Intent.DATA:     DataAnalysisAgent(memory=self._memory),
+            Intent.WRITING:  WritingAssistantAgent(memory=self._memory),
         }
 
         self._summariser = None
@@ -642,6 +712,8 @@ class Orchestrator:
 
         if enable_scheduler:
             self.start_scheduler()
+
+        self._user_id = "default"   # updated by run() per-call
 
         logger.info(
             "Orchestrator ready | session='%s' | agents=%d | "
@@ -694,6 +766,8 @@ class Orchestrator:
         """
         forced  = kwargs.pop("intent",  None)
         user_id = kwargs.get("user_id", None)
+        if user_id:
+            self._user_id = user_id
 
         intent = (
             Intent(forced) if isinstance(forced, str)
@@ -713,6 +787,16 @@ class Orchestrator:
             self._inject_episodic_context(query, kwargs)
         if user_id:
             kwargs.setdefault("user_id", user_id)
+
+
+        # ── Schedule detection ────────────────────────────────────────────────
+        # If the query contains a scheduling intent, register a user task
+        # and return a confirmation instead of running the normal agent.
+        sched_response = self._maybe_schedule_task(query, intent, user_id or self._user_id)
+        if sched_response is not None:
+            self._close_trace(trace_obj, sched_response)
+            self._memory.save_context(query, sched_response.output)
+            return sched_response
 
         # ── RAG pre-check ─────────────────────────────────────────────────────
         # Quick vector-store scan: if the KB already contains a good answer
@@ -761,6 +845,12 @@ class Orchestrator:
 
         if getattr(self, "_episodic", None) and response.output and not response.error:
             self._store_episodic_facts(query, response.output)
+
+        # Profile extraction — lightweight heuristics + async LLM extraction
+        if response.output and not response.error:
+            self._update_user_profile(
+                query, response.output, response.agent_name, user_id or self._user_id
+            )
 
         if getattr(self, "_summariser", None):
             try:
@@ -1014,6 +1104,16 @@ class Orchestrator:
             else self._route(query)
         )
 
+
+        # ── Schedule detection ────────────────────────────────────────────────
+        # If the query contains a scheduling intent, register a user task
+        # and return a confirmation instead of running the normal agent.
+        sched_response = self._maybe_schedule_task(query, intent, user_id or self._user_id)
+        if sched_response is not None:
+            self._close_trace(trace_obj, sched_response)
+            self._memory.save_context(query, sched_response.output)
+            return sched_response
+
         # ── RAG pre-check ─────────────────────────────────────────────────────
         if self._enable_rag_precheck:
             try:
@@ -1131,6 +1231,117 @@ class Orchestrator:
     # -------------------------------------------------------------------------
     #  Internal helpers
     # -------------------------------------------------------------------------
+
+
+
+    # ── Schedule detection ────────────────────────────────────────────────────
+
+    _SCHEDULE_TRIGGERS = re.compile(
+        r"\b(remind me|set a reminder|schedule|every (day|morning|evening|hour|week|"
+        r"\d+ (minutes?|hours?|days?))|send me (a|the) .{0,30} (every|each|daily|weekly))"
+        r"\b",
+        re.IGNORECASE,
+    )
+
+    def _maybe_schedule_task(
+        self,
+        query:   str,
+        intent:  "Intent",
+        user_id: str,
+    ) -> "Optional[AgentResponse]":
+        """
+        Check if the query is a scheduling request.
+
+        Recognises patterns like:
+          "Remind me to check Apple stock every hour"
+          "Schedule a news briefing every morning"
+          "Send me the weather every day"
+
+        Returns an AgentResponse confirmation, or None if not a schedule request.
+        """
+        if not self._SCHEDULE_TRIGGERS.search(query):
+            return None
+
+        try:
+            from core.user_task_scheduler import get_task_manager, parse_schedule
+
+            interval_min, desc = parse_schedule(query)
+            if interval_min <= 0:
+                return None   # couldn't parse an interval — let the agent handle it
+
+            mgr = get_task_manager()
+
+            # Infer the underlying task query (strip scheduling language)
+            task_query = re.sub(
+                r"remind me (to |about )?|schedule (a |an )?|send me (a |the )?|"
+                r"every (day|morning|evening|hour|\d+ (minutes?|hours?|days?))|"
+                r"daily|weekly",
+                "", query, flags=re.IGNORECASE,
+            ).strip()
+            if not task_query:
+                task_query = query
+
+            task = mgr.add_task(
+                user_id=user_id,
+                session_id=self._session_id,
+                description=task_query[:80],
+                query=task_query,
+                intent=intent.value,
+                interval_minutes=interval_min,
+            )
+
+            confirmation = (
+                f"✓ Scheduled: **{task_query[:60]}**\n"
+                f"Runs {desc} (Task ID: `{task.task_id}`).\n"
+                f"Use `:tasks` in the REPL to manage your scheduled tasks."
+            )
+            logger.info(
+                "Scheduled user task '%s' every %.0f min for user '%s'.",
+                task_query[:50], interval_min, user_id,
+            )
+            return AgentResponse(
+                output=confirmation,
+                agent_name="scheduler",
+                metadata={"task_id": task.task_id, "interval_minutes": interval_min},
+            )
+        except Exception as exc:
+            logger.debug("Schedule detection failed (non-fatal): %s", exc)
+            return None
+
+    def _update_user_profile(
+        self,
+        query:      str,
+        response:   str,
+        agent_name: str,
+        user_id:    str,
+    ) -> None:
+        """
+        Run fast heuristic profile extraction inline, then schedule the
+        heavier LLM-based extraction on a background thread to avoid
+        adding latency to the response path.
+        """
+        try:
+            from core.profile_extractor import (
+                extract_and_update_profile,
+                extract_and_update_profile_llm,
+            )
+            # Fast heuristics — synchronous, < 1 ms
+            extract_and_update_profile(
+                self._session_id, user_id, query, response, agent_name
+            )
+
+            # LLM extraction — background thread, every 5th turn
+            msg_count = len(self._memory.messages)
+            if msg_count % 10 == 0 and msg_count > 0:
+                import threading
+                t = threading.Thread(
+                    target=extract_and_update_profile_llm,
+                    args=(self._session_id, user_id, query, response),
+                    daemon=True,
+                )
+                t.start()
+        except Exception as exc:
+            logger.debug("Profile update failed (non-fatal): %s", exc)
 
     def _route(self, query: str) -> Intent:
         intent = _keyword_route(query)

@@ -8,6 +8,7 @@
 #    bash start.sh --mode chat      # force interactive text REPL
 #    bash start.sh --mode voice     # REPL with voice I/O (Whisper + TTS)
 #    bash start.sh --mode api       # FastAPI server on port 8080
+#    bash start.sh --mode web       # Web app with auth UI on port 8080
 #    bash start.sh --mode docker    # full Docker Compose stack
 #    bash start.sh --mode test      # run the full test suite
 #
@@ -61,6 +62,7 @@ while [[ $# -gt 0 ]]; do
       echo "  chat            Interactive text REPL (default)"
       echo "  voice           REPL with Whisper STT + TTS"
       echo "  api             FastAPI server (REST + WebSocket + SSE)"
+  echo "  web             Full web app with login UI — open browser to http://localhost:8080/ui/"
       echo "  docker          Full Docker Compose stack"
       echo "  test            Run the test suite (844 tests)"
       echo ""
@@ -79,7 +81,7 @@ while [[ $# -gt 0 ]]; do
       echo "  bash start.sh --ingest ./reports/ --mode chat"
       echo "  bash start.sh --backend vllm voice"
       exit 0 ;;
-    chat|voice|api|docker|test)
+    chat|voice|api|web|docker|test)
                   MODE="$1";        shift   ;;
     *)
       echo -e "${RED}Unknown argument: $1${RESET}"
@@ -94,7 +96,7 @@ done
 print_banner() {
   echo -e "${CYAN}${BOLD}"
   echo "  ╔══════════════════════════════════════════════════════════╗"
-  echo "  ║         Virtual Personal Assistant  v1.0                 ║"
+  echo "  ║         Virtual Personal Assistant  v1.0                ║"
   echo "  ║  Chat · Code · News · Search · Docs · Finance · Research ║"
   echo "  ╚══════════════════════════════════════════════════════════╝"
   echo -e "${RESET}"
@@ -403,6 +405,19 @@ PYEOF
 #  Launch modes
 # ─────────────────────────────────────────────────────────────────────────────
 
+launch_web() {
+  echo ""
+  echo -e "${BOLD}${CYAN}Starting web application…${RESET}"
+  echo -e "${DIM}  Open your browser at: http://localhost:${API_PORT}/ui/"
+  echo -e "  Default credentials:  admin / admin123  (change on first login)${RESET}"
+  echo ""
+  exec uvicorn api.server:app \
+    --host 0.0.0.0 \
+    --port "${API_PORT}" \
+    --reload \
+    --log-level info
+}
+
 launch_chat() {
   echo ""
   echo -e "${BOLD}${CYAN}Starting interactive REPL…${RESET}"
@@ -550,6 +565,7 @@ main() {
     chat)   launch_chat   ;;
     voice)  launch_voice  ;;
     api)    launch_api    ;;
+    web)    launch_web    ;;
     test)   launch_test   ;;
     *)      fail "Unknown mode: ${MODE}" ;;
   esac

@@ -27,16 +27,21 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import (
-    FastAPI, File, Form, HTTPException, Query,
+    Depends, FastAPI, File, Form, HTTPException, Query,
     UploadFile, WebSocket, WebSocketDisconnect,
 )
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from agents.base_agent import AgentResponse
-from agents.orchestrator import Orchestrator
+from agents import AgentResponse, Orchestrator
+from api.auth import (
+    TokenResponse, UserCreate, UserOut,
+    authenticate_user, create_access_token, create_user,
+    decode_token, get_user_by_id, init_db,
+)
 from api.rate_limiter import RateLimitMiddleware
 from api.sse import router as sse_router
 from config import settings
@@ -45,6 +50,8 @@ from core.logging import setup_logging
 from core.tracing import get_tracer
 
 logger = logging.getLogger(__name__)
+
+_bearer = HTTPBearer(auto_error=False)
 
 # ── App setup ────────────────────────────────────────────────────────────────
 setup_logging()
@@ -72,7 +79,8 @@ app.include_router(sse_router)
 
 @app.on_event("startup")
 async def on_startup() -> None:
-    """Run pre-flight checks on server start."""
+    """Run pre-flight checks and initialise auth DB on server start."""
+    init_db()   # create users.db + seed admin if empty
     from api.startup_validator import run_startup_checks
     loop = __import__("asyncio").get_event_loop()
     await loop.run_in_executor(
@@ -85,7 +93,19 @@ async def on_startup() -> None:
     )
 
 # Mount UI static files (built separately)
-_UI_DIR = Path(__file__).parent.parent / "ui" / "dist"
+_UI_DIR = Path(__file__).parent.parent / "ui"
+
+@app.get("/", include_in_schema=False)
+@app.get("/ui", include_in_schema=False)
+@app.get("/ui/", include_in_schema=False)
+async def serve_ui():
+    """Serve the SPA entry point."""
+    from fastapi.responses import HTMLResponse
+    html_path = _UI_DIR / "index.html"
+    if html_path.exists():
+        return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
+    return HTMLResponse("<h1>UI not found</h1><p>Make sure ui/index.html exists.</p>", status_code=404)
+
 if _UI_DIR.exists():
     app.mount("/ui", StaticFiles(directory=str(_UI_DIR), html=True), name="ui")
 
@@ -188,6 +208,58 @@ async def _chat_trace(tracer, session_id: str, query: str) -> _AsyncGen:
 #  REST endpoints
 # ─────────────────────────────────────────────────────────────────────────────
 
+
+# =============================================================================
+#  Authentication endpoints
+# =============================================================================
+
+def _get_current_user(
+    creds: HTTPAuthorizationCredentials = Depends(_bearer),
+) -> UserOut:
+    """FastAPI dependency — validate Bearer JWT and return the user."""
+    if creds is None:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    payload = decode_token(creds.credentials)
+    if payload is None:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    user = get_user_by_id(int(payload["sub"]))
+    if user is None:
+        raise HTTPException(status_code=401, detail="User not found")
+    return user
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/auth/register", response_model=TokenResponse, tags=["Auth"])
+async def register(data: UserCreate) -> TokenResponse:
+    """Register a new user account and receive a JWT."""
+    try:
+        user = create_user(data)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    token = create_access_token(user)
+    return TokenResponse(access_token=token, username=user.username, user_id=user.id)
+
+
+@app.post("/auth/login", response_model=TokenResponse, tags=["Auth"])
+async def login(data: LoginRequest) -> TokenResponse:
+    """Authenticate with username + password and receive a JWT."""
+    user = authenticate_user(data.username, data.password)
+    if user is None:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    token = create_access_token(user)
+    return TokenResponse(access_token=token, username=user.username, user_id=user.id)
+
+
+@app.get("/auth/me", response_model=UserOut, tags=["Auth"])
+async def me(current_user: UserOut = Depends(_get_current_user)) -> UserOut:
+    """Return the currently authenticated user's profile."""
+    return current_user
+
+
 @app.get("/health", response_model=HealthResponse, tags=["System"])
 async def health():
     """Liveness probe."""
@@ -280,8 +352,8 @@ async def clear_memory(session_id: str):
 
 @app.post("/documents/ingest", tags=["Documents"])
 async def ingest_document(
-        file: UploadFile = File(...),
-        session_id: str = Form(default="api"),
+    file: UploadFile = File(...),
+    session_id: str = Form(default="api"),
 ):
     """Upload and ingest a document (PDF, DOCX, XLSX, PPTX)."""
     from document_processing import SUPPORTED_SUFFIXES
@@ -326,6 +398,62 @@ async def list_documents():
     ]
 
 
+
+
+@app.post("/documents/bulk-ingest")
+async def bulk_ingest(
+    directory: Optional[str] = None,
+    paths: Optional[str] = None,
+    recursive: bool = True,
+    dry_run: bool = False,
+):
+    """
+    Bulk-ingest documents into the knowledge base.
+
+    Pass either:
+      - ``directory``: path to a folder (all supported files ingested)
+      - ``paths``: comma-separated list of file paths
+
+    Set ``dry_run=true`` to inspect without writing.
+    """
+    from document_processing.mass_uploader import MassUploader
+    uploader = MassUploader()
+    try:
+        if directory:
+            report = uploader.upload_directory(
+                directory, recursive=recursive, dry_run=dry_run
+            )
+        elif paths:
+            path_list = [p.strip() for p in paths.split(",") if p.strip()]
+            report = uploader.upload_files(path_list, dry_run=dry_run)
+        else:
+            return {"error": "Provide 'directory' or 'paths'"}
+
+        return {
+            "ok": report.ok_count,
+            "duplicate": report.duplicate_count,
+            "error": report.error_count,
+            "unsupported": report.unsupported_count,
+            "chunks_added": report.total_chunks_added,
+            "elapsed_ms": report.total_elapsed_ms,
+            "dry_run": report.is_dry_run,
+            "outcomes": [
+                {
+                    "file": o.filename,
+                    "status": o.status,
+                    "doc_type": o.doc_type.value,
+                    "strategy": o.strategy.value,
+                    "chunks_added": o.chunks_added,
+                    "error": o.error or None,
+                }
+                for o in report.outcomes
+            ],
+        }
+    except NotADirectoryError as exc:
+        return {"error": str(exc)}
+    except Exception as exc:
+        return {"error": f"Bulk ingest failed: {exc}"}
+
 @app.delete("/documents/{doc_title}", tags=["Documents"])
 async def delete_document(doc_title: str):
     """Remove a document from the knowledge base."""
@@ -339,9 +467,9 @@ async def delete_document(doc_title: str):
 
 @app.get("/documents/search", response_model=list[SearchResult], tags=["Documents"])
 async def search_documents(
-        q: str = Query(..., min_length=1, description="Search query"),
-        k: int = Query(default=5, ge=1, le=20),
-        doc_title: Optional[str] = Query(None),
+    q: str = Query(..., min_length=1, description="Search query"),
+    k: int = Query(default=5, ge=1, le=20),
+    doc_title: Optional[str] = Query(None),
 ):
     """Semantic search across the knowledge base."""
     from document_processing import DocumentManager

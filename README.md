@@ -1,88 +1,159 @@
 # Virtual Personal Assistant
 
-A fully local, privacy-first AI assistant built on LangChain, Ollama, and ChromaDB.
+A fully local, privacy-first AI assistant with a modern web interface.
 Runs entirely on your machine — no data leaves your network.
 
-**1,088 tests · 23 test files · 99 Python files · 32,000+ lines**
+**1,088 tests · 23 test files · 100 Python files**
 
 ---
 
 ## Quick Start
 
 ```bash
-# 1. Pull required models
-ollama pull llama3.1:8b          # chat and all general agents
-ollama pull nomic-embed-text     # document embeddings
-ollama pull deepseek-r1:7b       # deep research (reasoning model)
+# 1. Pull required Ollama models
+ollama pull llama3.1:8b           # chat and all general agents
+ollama pull nomic-embed-text      # document embeddings
+ollama pull deepseek-r1:7b        # deep research reasoning model
 
-# 2. Install Playwright browser (for JS-rendered page fetching)
+# 2. Install Playwright browser (JS-rendered page fetching)
 playwright install chromium
 
-# 3. Launch
-bash start.sh                    # interactive REPL
-bash start.sh api                # REST + WebSocket + SSE server on :8080
-bash start.sh --query "What is CRISPR?"   # single-shot query
-bash start.sh --ingest ./docs/            # ingest a directory
+# 3. Install dependencies
+pip install -r requirements.txt
+
+# 4. Launch — choose your mode
+bash start.sh web                 # full web app  →  http://localhost:8080/ui/
+bash start.sh                     # interactive terminal REPL
+bash start.sh api                 # REST + WebSocket API only
+bash start.sh --query "What is CRISPR?"  # single-shot query
+bash start.sh --ingest ./docs/    # ingest a directory
 ```
+
+Default web credentials: **admin / admin123** — change immediately via the Register tab.
+
+---
+
+## Web Interface
+
+Start with `bash start.sh web`, then open **http://localhost:8080/ui/** in your browser.
+
+### Login & Registration
+
+- **Sign In** tab — username + password login, JWT token issued on success
+- **Register** tab — create a new account (username, email, password ≥ 6 chars)
+- Credentials stored in `data/auth/users.db` (SQLite, bcrypt-hashed passwords)
+- JWT tokens are HS256-signed, 24-hour lifetime (configurable via `AUTH_TOKEN_EXPIRE_MINUTES`)
+
+### Chat Interface
+
+Designed like a modern LLM application:
+
+- **Welcome screen** with clickable suggestion prompts to get started quickly
+- **Message bubbles** — user messages right (indigo gradient), assistant messages left (bordered)
+- **Per-agent label** above each response showing which agent answered
+- **Streaming simulation** — responses render token-by-token rather than appearing all at once
+- **Markdown rendering** with full syntax highlighting (code blocks, tables, lists, blockquotes)
+- **Copy** and **Retry** action buttons appear on hover over any message
+- **Source reference pills** appear inline at the bottom of responses that cite documents
+
+### Left Sidebar — Conversation History
+
+Toggle with the **☰** button. Persisted to `localStorage`.
+
+- Conversations grouped into **Today / Yesterday / Earlier**
+- Each entry shows an auto-generated title (first message), timestamp, and emoji icon
+- Hover a conversation to reveal the **✕** delete button
+- **+** button starts a new conversation
+
+### Right Sidebar — Resources
+
+Toggle with the **⊞** button. Three tabs:
+
+| Tab | Content |
+|---|---|
+| **Sources** | Reference list from the last response, with file-type icons. Offers the 3D graph when ≥ 2 sources are present. |
+| **Documents** | All documents currently ingested in the knowledge base |
+| **3D Graph** | Interactive three-dimensional relationship graph |
+
+### 3D Relationship Graph
+
+When a response cites multiple sources, a **View 3D Relationship Graph** button appears in the Sources tab. Switching to the Graph tab renders a live Three.js scene:
+
+- **Central node** (purple, pulsing) represents the query
+- **Source nodes** orbit the centre, colour-coded and spaced on a Fibonacci sphere for even distribution
+- **Catmull-Rom curve edges** connect each source to the centre, with particle points along each edge
+- **Rotating torus glow ring** around the central node
+- **Mouse drag** — orbit the scene
+- **Scroll wheel** — zoom in / out
+- **Hover** — raycasting tooltip shows the full reference text
+- **↻ button** — toggle auto-rotation
+- **⊙ button** — reset camera position
+- **Colour legend** below the canvas maps each colour to its source
+
+### Agent Selection
+
+Click any agent pill in the header to force the next message to a specific agent:
+
+`auto` · `chat` · `code` · `news` · `search` · `document` · `finance` · `research` · `data` · `writing`
+
+### Input Controls
+
+- **Enter** — send message · **Shift+Enter** — new line
+- **📚 RAG** toggle — enable / disable the vector-store pre-check (highlighted when active)
+- **📎 Upload** — upload and ingest a document directly from the chat interface
 
 ---
 
 ## Architecture
 
 ```
-User  (REPL · API · Voice · CLI)
+Browser  (http://localhost:8080/ui/)
   │
+  │  HTTP/WebSocket
   ▼
-Orchestrator
-  ├── Stage 1: keyword regex router (fast, no LLM)
-  ├── Stage 2: LLM classifier (ambiguous queries only)
-  ├── Schedule detector  ─── "remind me every hour" → TaskScheduler
-  ├── RAG pre-check      ─── vector store scan before any agent
-  │
-  └── Agent registry (9 specialist agents + fallback chains)
-        ChatAgent          ← conversation, creative, opinions
-        CodeAgent          ← write / debug / execute / save code
-        NewsAgent          ← RSS feeds, headlines, topic news
-        SearchAgent        ← web search, Wikipedia, calculator
-        DocumentAgent      ← PDF/DOCX/XLSX/PPTX Q&A
-        FinancialAgent     ← stock quotes, ratios, earnings, analysis
-        DeepResearchAgent  ← multi-turn plan→gather→evaluate→synthesise
-        DataAnalysisAgent  ← CSV/Excel, pandas, matplotlib charts
-        WritingAssistantAgent ← outline→draft→edit→DOCX/Markdown export
+FastAPI Server  (api/server.py)
+  ├── /auth/login · /auth/register · /auth/me   ← JWT auth
+  ├── /chat                                      ← single-turn query
+  ├── /ws/{session_id}                           ← streaming WebSocket
+  ├── /stream                                    ← SSE streaming
+  ├── /documents/*                               ← KB management
+  ├── /health · /metrics · /traces
+  └── /ui/*                                      ← SPA static files
+       │
+       ▼
+  Orchestrator
+    ├── Stage 1: keyword regex router  (fast, no LLM)
+    ├── Stage 2: LLM classifier        (ambiguous queries only)
+    ├── Schedule detector  ── "remind me every hour" → TaskScheduler
+    ├── RAG pre-check      ── vector store scan before any agent
+    │
+    └── Agent registry (9 specialist agents + fallback chains)
+          ChatAgent              conversation, creative, opinions
+          CodeAgent              write / debug / execute / save code
+          NewsAgent              RSS feeds, headlines, topic news
+          SearchAgent            web search, Wikipedia, calculator
+          DocumentAgent          PDF/DOCX/XLSX/PPTX Q&A
+          FinancialAgent         stock quotes, ratios, earnings
+          DeepResearchAgent      plan → gather → evaluate → synthesise
+          DataAnalysisAgent      CSV/Excel, pandas, matplotlib charts
+          WritingAssistantAgent  outline → draft → edit → DOCX/Markdown
 ```
-
-### Fallback chains
-
-| Primary | Fallbacks |
-|---|---|
-| DOCUMENT | SEARCH → CHAT |
-| SEARCH | DOCUMENT → CHAT |
-| NEWS | SEARCH → CHAT |
-| FINANCE | SEARCH → CHAT |
-| CODE | SEARCH → CHAT |
-| RESEARCH | SEARCH → CHAT |
-| DATA | CODE → CHAT |
-| WRITING | CHAT |
-| CHAT | SEARCH |
 
 ---
 
 ## Agents
 
 ### ChatAgent
-General-purpose conversational agent. Injects full conversation history and
-user style preferences. True token-by-token streaming in the REPL.
+General-purpose conversation. Injects full history and user style preferences. True token-by-token streaming.
 
-**Triggers:** greetings, opinions, explanations, creative writing, brainstorming, follow-up questions
+**Triggers:** greetings, opinions, explanations, creative writing, follow-up questions
 
 ### CodeAgent
 Writes, debugs, reviews, and executes Python. Saves output as files.
 
-**Tools:** `code_writer` · `code_reviewer` · `python_executor` (sandboxed) ·
-`save_code_file` · `save_text_file`
+**Sandbox:** expanded blocklist (filesystem / subprocess / socket / import tricks), minimal env isolation, 64 KB output cap.
 
-**Sandbox:** expanded blocklist (os.remove / shutil / subprocess / socket / import tricks),
-minimal env isolation, 64 KB output cap.
+**Tools:** `code_writer` · `code_reviewer` · `python_executor` · `save_code_file` · `save_text_file`
 
 **Triggers:** write / debug / review / execute code
 
@@ -94,95 +165,70 @@ Fetches and summarises news from RSS feeds and DuckDuckGo News.
 **Triggers:** news, headlines, latest, breaking, current events
 
 ### SearchAgent
-Factual lookup, web search, Wikipedia, and arithmetic.
+Factual lookup, web search, Wikipedia, arithmetic.
 
-**Tools:** `web_search` · `ranked_web_search` · `fetch_webpage` ·
-`fetch_webpage_js` · `wikipedia_lookup` · `calculator`
+**Tools:** `web_search` · `ranked_web_search` · `fetch_webpage` · `fetch_webpage_js` · `wikipedia_lookup` · `calculator`
 
 **Triggers:** what is, who is, how does, search for, calculate
 
 ### DocumentAgent
-Answers questions about uploaded documents. Auto-detects comparison and
-table queries for specialised handling.
+Answers questions about uploaded documents. Auto-detects comparison and table queries.
 
-**Tools:** `search_documents` · `search_documents_tables` · `compare_documents` ·
-`ingest_document` · `update_document` · `list_documents` · `get_full_document` ·
-`delete_document` · `bulk_ingest_directory` · `bulk_ingest_files`
+**Tools:** `search_documents` · `search_documents_tables` · `compare_documents` · `ingest_document` · `update_document` · `list_documents` · `get_full_document` · `delete_document` · `bulk_ingest_directory`
 
 **Triggers:** in the document, uploaded file, knowledge base, what does the report say
 
 ### FinancialAgent
-Stock quotes, financial ratios, earnings, portfolio analysis.
+Stock quotes, ratios, earnings, portfolio analysis.
 
-**Tools:** `stock_quote` · `company_profile` · `financial_ratios` ·
-`price_history` · `income_statement` · `compare_stocks` · `financial_summary`
+**Tools:** `stock_quote` · `company_profile` · `financial_ratios` · `price_history` · `income_statement` · `compare_stocks` · `financial_summary`
 
 **Triggers:** stock price, P/E ratio, earnings, revenue, market cap, portfolio
 
 ### DeepResearchAgent
-Multi-turn research pipeline using a dedicated reasoning model.
+Multi-turn research using a dedicated reasoning model.
 
-**Workflow:** `Plan` (sub-questions + search queries) →
-`Gather` (web + Wikipedia) → `Evaluate` (SUFFICIENT or NEED_MORE) →
-`Synthesise` (Markdown report with `[n]` citations)
+**Workflow:** Plan (sub-questions + queries) → Gather (web + Wikipedia) → Evaluate (SUFFICIENT or NEED_MORE) → Synthesise (Markdown report with citations)
 
-**Model:** `OLLAMA_REASONING_MODEL` (default: `deepseek-r1:7b`). Strips
-`<think>…</think>` blocks from deepseek-r1 output.
+**Model:** `OLLAMA_REASONING_MODEL` (default: `deepseek-r1:7b`)
 
-**Triggers:** research, deep dive, comprehensive report, literature review, investigate
+**Triggers:** research, deep dive, comprehensive report, literature review
 
 ### DataAnalysisAgent *(new)*
-Analyses structured data (CSV, TSV, Excel) with pandas and matplotlib.
-A shared `_FRAMES` registry keeps datasets in memory across tool calls within
-one session.
-
-**Tools:**
+Analyses structured data with pandas and matplotlib.
 
 | Tool | What it does |
 |---|---|
-| `load_data` | Load CSV / TSV / Excel → pandas DataFrame |
+| `load_data` | Load CSV / TSV / Excel → DataFrame |
 | `inspect_data` | Shape, dtypes, head, describe, missing values |
-| `run_pandas` | Execute arbitrary pandas code (blocklisted); captures `result` or `print()` |
-| `plot_data` | Generate matplotlib chart → PNG in `data/uploads/generated/charts/` |
+| `run_pandas` | Execute pandas code (blocklisted); captures `result` or `print()` |
+| `plot_data` | Generate matplotlib chart → PNG |
 | `export_data` | Save transformed DataFrame → CSV or Excel |
-| `list_loaded_data` | Show all datasets currently in memory |
+| `list_loaded_data` | Show all datasets in memory |
 
-**Auto-load:** if `file_path` is in the query kwargs or the query mentions a
-file path, the dataset is loaded before the ReAct loop starts.
-
-**Triggers:** CSV, Excel, spreadsheet, pandas, plot, chart, correlation,
-distribution, group by, aggregate, analyse the data
+**Triggers:** CSV, Excel, pandas, plot, chart, correlation, group by, analyse the data
 
 ### WritingAssistantAgent *(new)*
-Long-form writing partner: outline → draft → edit → export.
-A shared `_DRAFTS` registry stores all drafts in memory within one session.
-
-**Tools:**
+Long-form writing partner.
 
 | Tool | What it does |
 |---|---|
-| `create_outline` | LLM → structured JSON outline with section headings and notes |
-| `draft_section` | Write one section at a time with full prior-section context |
-| `assemble_draft` | Combine all sections into a single Markdown document |
-| `edit_draft` | Rewrite full draft or one section on natural-language instructions |
+| `create_outline` | LLM → structured outline with headings and notes |
+| `draft_section` | Write one section at a time with full prior context |
+| `assemble_draft` | Combine all sections into one Markdown document |
+| `edit_draft` | Rewrite full draft or one section on instructions |
 | `export_markdown` | Save to `.md` file |
-| `export_docx` | Save to `.docx` (Heading styles, bold/italic, page margins) |
-| `list_drafts` | Show active drafts with completion status |
+| `export_docx` | Save to `.docx` (heading styles, bold/italic, page margins) |
 
-**Fast path:** emails, poems, ≤ 300 words, or "brief/short/concise" keywords
-bypass the outline pipeline and call the LLM directly.
+**Fast path:** emails, poems, ≤ 300 words, or "brief/quick/short" — bypasses the outline pipeline.
 
-**Doc-type inference:** automatically detects article / essay / report /
-blog_post / email / letter / technical_doc / poem from the query.
-
-**Triggers:** write an article / essay / report, draft a report, compose a letter,
-create a blog post, help me write, outline for, export to DOCX
+**Triggers:** write an article / essay / report, draft a report, compose a letter, create a blog post, export to DOCX
 
 ---
 
 ## Document Preprocessing Pipeline
 
-Every document passes through a three-stage pipeline before vector storage.
+Every document passes through three stages before vector storage.
 
 ### Stage 1 — Parse → Markdown
 
@@ -190,135 +236,79 @@ Docling converts the source to structured Markdown. Fallback renderers:
 
 | Format | Renderer | Output |
 |---|---|---|
-| PDF | Docling ▸ pypdf | `## Page N` headings + paragraphs |
+| PDF | Docling ▸ pypdf | `## Page N` + paragraphs |
 | DOCX | Docling ▸ python-docx | `# / ## / ###` headings + body |
 | XLSX | Docling ▸ openpyxl | `## Sheet` + GFM pipe-table |
-| PPTX | Docling ▸ python-pptx | `## Slide N` headings + body |
+| PPTX | Docling ▸ python-pptx | `## Slide N` + body |
 
 ### Stage 2 — UTF-8 normalisation (`to_utf8`)
 
 ```
 bytes → decode(source_encoding, errors="replace")
-     → UTF-8 round-trip  (flush lone surrogate code points)
+     → UTF-8 round-trip  (flush lone surrogates)
      → unicodedata.normalize("NFKC")   ﬁ→fi · １→1 · ™→TM
-     → strip control chars  (\x00–\x1f, \x7f–\x9f except \t \n \r)
+     → strip control chars (\x00–\x1f, \x7f–\x9f except \t \n \r)
 ```
 
 ### Stage 3 — Heading-aware chunking
 
-Markdown is parsed line-by-line. The active heading stack is tracked and
-embedded in every chunk's `section_path`. `## Page N` / `## Slide N` markers
-set `page_number` without polluting the breadcrumb.
-
-### Chunk metadata
-
-```python
-DocumentChunk(
-    chunk_id     = "a3f9c2d1b8e47f6a",   # SHA-256 of path:page:offset
-    text         = "## Revenue\n\n| Q | Revenue |\n…",  # UTF-8 Markdown
-    doc_path     = "/data/uploads/Q3_Report.pdf",
-    doc_title    = "Q3 Report",
-    page_number  = 4,
-    section_path = ["Financial Summary", "Revenue Analysis"],
-    metadata     = {"doctype": "pdf", "markdown_source": True},
-)
-```
-
----
-
-## Mass Document Upload
-
-```bash
-python cli.py ingest ./docs/ --directory --workers 4
-python cli.py ingest ./docs/ --directory --dry-run   # plan only
-python cli.py ingest report.pdf                       # single file
-```
-
-**Split-lane processing** — pdfium safety:
-- DOCLING / FALLBACK (PDF, DOCX) → sequential lane, fresh processor per file
-- TEXT / STRUCTURED (TXT, MD, CSV, JSON) → parallel `ThreadPoolExecutor`
-
-**Document update:**
-```bash
-python cli.py ingest updated_report.pdf   # replaces old version if content hash changed
-```
-`ingest_or_update()` computes SHA-256 of the file content. If the hash matches
-the stored chunks it skips; if changed it deletes all old chunks and re-ingests.
+Markdown is parsed line-by-line. The active heading stack is tracked and embedded in every chunk's `section_path`.
 
 ---
 
 ## Memory & Personalisation
 
 ### User profile
-Learned automatically from conversation — no configuration required.
+Learned automatically from conversation.
 
-```
-You: My name is Alice and I prefer technical answers.
-Assistant: Got it, Alice. I'll keep my responses technical.
-```
+- **Fast heuristics** (< 1ms, every turn): name extraction via regex (`"My name is X"`)
+- **LLM extraction** (background thread, every 10th turn): interests, style preference, preferred agent
+- Stored in `data/logs/user_prefs/<user_id>.json`
 
-- **Fast heuristics** (< 1ms, every turn): name extraction via regex
-- **LLM extraction** (background thread, every 10th turn): interests, style, preferred agent
-- Stored in `data/logs/user_prefs/<user_id>.json` (Pydantic model)
-
-REPL: `:prefs` (view profile) · `:memory` (long-term facts)
+**REPL:** `:prefs` · `:memory`
 
 ### Session recall
-When you return after ≥ 4 hours, the assistant greets you with a recap of
-the last 3 stored facts from episodic memory.
+When you return after ≥ 4 hours, the assistant greets you with a recap of recent stored facts.
 
-### Long-term memory (episodic)
-Enabled by default. After each response the LLM extracts 0–3 memorable facts
-and stores them in a dedicated ChromaDB collection (`episodic_memory`).
-Facts are recalled automatically on semantically relevant future queries.
+### Long-term memory
+Enabled by default. After each response the LLM extracts 0–3 memorable facts stored in ChromaDB (`episodic_memory` collection).
 
 ---
 
 ## Task Scheduling
 
-Schedule recurring tasks using natural language:
-
 ```
 You: Remind me to check Apple stock every hour.
 You: Send me a news briefing every morning.
-You: Schedule a portfolio analysis every Friday.
 ```
 
-The orchestrator detects scheduling patterns and registers tasks with the
-background `TaskScheduler`. Tasks persist to `data/logs/user_tasks.json`
-and reload on startup.
+The orchestrator detects scheduling patterns and registers tasks with the background `TaskScheduler`. Tasks persist to `data/logs/user_tasks.json` and reload on restart.
 
-REPL: `:tasks` — view and manage scheduled tasks.
+**REPL:** `:tasks`
 
 ---
 
 ## File Output
 
-Agents can save results as files:
+Agents can save results as files to `data/uploads/generated/`:
 
 ```
 You: Write a Python script to analyse the CSV and save it.
-You: Generate a Markdown report on this topic and save it.
-You: Export this data as JSON.
 You: Write a report and export it to Word.
+You: Export this data as JSON.
 ```
 
-Files saved to `data/uploads/generated/` (text / code / JSON) or
-`data/uploads/generated/charts/` (PNG charts) or
-`data/uploads/generated/writing/` (DOCX / Markdown documents).
+Charts save to `data/uploads/generated/charts/`. Writing exports save to `data/uploads/generated/writing/`.
 
 ---
 
 ## Web Capabilities
 
 ### Re-ranked search (`ranked_web_search`)
-Fetches up to 8 raw DuckDuckGo results, uses the LLM to score each by
-relevance, returns the top-k. Falls back to raw results on any error.
+Fetches up to 8 DuckDuckGo results, uses the LLM to score each for relevance, returns the top-k.
 
 ### JS-rendered pages (`fetch_webpage_js`)
-Headless Chromium (Playwright) fetches pages requiring JavaScript: SPAs,
-dynamic dashboards, cookie-gated content. Supports an optional CSS selector
-click before extraction (e.g. dismiss cookie banners).
+Headless Chromium via Playwright — handles SPAs, dynamic dashboards, cookie banners.
 
 ```bash
 playwright install chromium   # one-time setup
@@ -326,23 +316,11 @@ playwright install chromium   # one-time setup
 
 ---
 
-## Conversation Context
-
-All specialist agents receive recent history when a follow-up is detected:
-
-| Signal | Examples |
-|---|---|
-| Short query (≤ 4 words) | `"why?"` `"how?"` `"and then?"` |
-| Referential pronoun | `"it"` `"this"` `"the code above"` `"what you just wrote"` |
-| Continuation word | `"but"` `"so"` `"also"` `"additionally"` |
-
-Context is prepended automatically — no user action required.
-
----
-
 ## REPL Commands
 
-Start an interactive session: `python cli.py chat` or `bash start.sh`
+```bash
+bash start.sh   # or: python cli.py chat
+```
 
 | Command | Description |
 |---|---|
@@ -350,17 +328,15 @@ Start an interactive session: `python cli.py chat` or `bash start.sh`
 | `:quit` / `:exit` | Exit |
 | `:clear` | Clear conversation memory |
 | `:docs` | List ingested documents |
-| `:ingest <path>` | Ingest a document into the knowledge base |
-| `:delete <title>` | Remove a document from the knowledge base |
-| `:agent <n>` | Force the next query to a specific agent |
+| `:ingest <path>` | Ingest a document |
+| `:delete <title>` | Remove a document |
+| `:agent <n>` | Force next query to a specific agent |
 | `:history` | Show recent conversation turns |
 | `:voice` | Toggle voice I/O |
 | `:rag on/off` | Enable or disable the RAG pre-check |
-| `:prefs` | Show your user profile and learned preferences |
-| `:memory` | Show stored long-term facts from past sessions |
-| `:tasks` | Show and manage your scheduled recurring tasks |
-
-Valid agents for `:agent`: `chat` · `code` · `news` · `search` · `document` · `finance` · `research` · `data` · `writing`
+| `:prefs` | Show your user profile |
+| `:memory` | Show stored long-term facts |
+| `:tasks` | Show and manage scheduled tasks |
 
 ---
 
@@ -369,34 +345,30 @@ Valid agents for `:agent`: `chat` · `code` · `news` · `search` · `document` 
 ```bash
 # Single query
 python cli.py ask "Explain SOLID principles"
-python cli.py ask "Write a sort function"          --agent code
-python cli.py ask "Apple P/E ratio"                --agent finance
-python cli.py ask "Research quantum computing"     --agent research
-python cli.py ask "Analyse sales.csv"              --agent data
-python cli.py ask "Write a blog post about AI"     --agent writing
-python cli.py ask "What is CRISPR?" --no-rag       # skip RAG pre-check
+python cli.py ask "Write a sort function"            --agent code
+python cli.py ask "Apple P/E ratio"                  --agent finance
+python cli.py ask "Research quantum computing"       --agent research
+python cli.py ask "Analyse sales.csv"                --agent data
+python cli.py ask "Write a blog post about AI"       --agent writing
+python cli.py ask "What is CRISPR?" --no-rag
 
-# Document management
+# Documents
 python cli.py ingest report.pdf
 python cli.py ingest ./docs/ --directory --workers 4
 python cli.py ingest ./docs/ --directory --dry-run
-
 python cli.py docs list
 python cli.py docs search "revenue Q3" --threshold 0.6
-python cli.py docs search "costs" --doc "Q3 Report"
 python cli.py docs delete "Q3 Report"
 python cli.py docs stats
 
 # Utilities
 python cli.py transcribe meeting.wav
-python cli.py config                               # show all settings
+python cli.py config
 ```
 
 ---
 
-## Configuration
-
-All settings live in `.env` (copy `.env.example` to get started).
+## Configuration (`.env`)
 
 ### LLM
 
@@ -406,12 +378,10 @@ All settings live in `.env` (copy `.env.example` to get started).
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | |
 | `OLLAMA_MODEL` | `llama3.1:8b` | All agents except DeepResearch |
 | `OLLAMA_REASONING_MODEL` | `deepseek-r1:7b` | DeepResearchAgent only |
-| `VLLM_BASE_URL` | `http://localhost:8000/v1` | Only when `LLM_BACKEND=vllm` |
-| `VLLM_MODEL` | `mistralai/Mistral-7B-Instruct-v0.2` | |
 
 **Model sizing guide:**
 
-| RAM / VRAM | Recommended model |
+| RAM / VRAM | Recommended |
 |---|---|
 | ≤ 4 GB | `llama3.2:3b` · `phi3:mini` |
 | ≤ 8 GB | `llama3.1:8b` · `mistral:7b` ← default |
@@ -424,53 +394,40 @@ All settings live in `.env` (copy `.env.example` to get started).
 |---|---|---|
 | `EMBEDDING_BACKEND` | `ollama` | `ollama` (recommended) or `huggingface` |
 | `OLLAMA_EMBEDDING_MODEL` | `nomic-embed-text` | Pull with `ollama pull nomic-embed-text` |
-| `EMBEDDING_DEVICE` | `cpu` | HuggingFace only: `cpu` / `cuda` / `mps` |
-| `EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | HuggingFace only |
 | `EMBEDDING_BATCH_SIZE` | `32` | Lower for < 6 GB VRAM |
 
-`EMBEDDING_BACKEND=ollama` is the recommended default — embeddings run inside the
-Ollama server process, leaving application-side VRAM free for Docling and the LLM.
+### Authentication
+
+| Variable | Default | Notes |
+|---|---|---|
+| `AUTH_SECRET_KEY` | auto-generated | Set in `.env` for stable tokens across restarts |
+| `AUTH_TOKEN_EXPIRE_MINUTES` | `1440` | JWT lifetime (24 hours) |
 
 ### Vector Store
 
 | Variable | Default | Notes |
 |---|---|---|
 | `VECTOR_STORE_PATH` | `./data/vector_store` | ChromaDB files |
-| `VECTOR_STORE_COLLECTION` | `assistant_docs` | |
 | `CHUNK_SIZE` | `512` | Characters per chunk |
 | `CHUNK_OVERLAP` | `64` | Overlap between chunks |
-| `UPLOADS_PATH` | `./data/uploads` | Ingested files + generated output |
 
 ### Deep Research
 
 | Variable | Default | Notes |
 |---|---|---|
-| `RESEARCH_MAX_ITERATIONS` | `5` | Gather→evaluate cycles (~15–60s each) |
+| `RESEARCH_MAX_ITERATIONS` | `5` | Gather→evaluate cycles |
 | `RESEARCH_MAX_SOURCES` | `8` | Max evidence items |
-| `RESEARCH_CHUNK_BUDGET` | `6000` | Chars passed to synthesis prompt |
+| `RESEARCH_CHUNK_BUDGET` | `6000` | Characters passed to synthesis |
 
-### Agent Behaviour
+### Agent / Voice / API
 
 | Variable | Default | Notes |
 |---|---|---|
 | `AGENT_MAX_ITERATIONS` | `15` | ReAct loop limit |
-| `AGENT_VERBOSE` | `false` | Print tool calls to stdout |
 | `MEMORY_MAX_TOKENS` | `4096` | Conversation memory budget |
-
-### Voice
-
-| Variable | Default | Notes |
-|---|---|---|
-| `VOICE_ENABLED` | `false` | Microphone input + TTS output |
+| `VOICE_ENABLED` | `false` | Requires ffmpeg + portaudio |
 | `WHISPER_MODEL` | `base` | `tiny` / `base` / `small` / `medium` / `large` |
-| `VOICE_LANGUAGE` | `en` | ISO 639-1 language code |
-
-### API Server
-
-| Variable | Default | Notes |
-|---|---|---|
 | `RATE_LIMIT_REQUESTS` | `60` | Requests per window per IP |
-| `RATE_LIMIT_WINDOW` | `60` | Window size in seconds |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
 
 ---
@@ -479,33 +436,35 @@ Ollama server process, leaving application-side VRAM free for Docling and the LL
 
 | Feature | Detail |
 |---|---|
+| **Web UI** | Login · chat · history sidebar · resources sidebar · 3D graph |
+| **JWT authentication** | SQLite user DB, bcrypt hashing, HS256 tokens, 24 h expiry |
+| **3D relationship graph** | Three.js — orbit/zoom/hover, Fibonacci layout, auto-rotate |
 | **9 specialist agents** | Chat · Code · News · Search · Document · Finance · Research · Data · Writing |
-| **Intent routing** | 2-stage: keyword regex (fast) → LLM classifier (ambiguous) |
-| **RAG pre-check** | Vector store scan before any agent; skipped for code/chat/research/data/writing |
-| **Fallback loop** | Quality-gated fallback chain with synthesis on total failure |
-| **Streaming responses** | Token-by-token REPL streaming via `Orchestrator.stream_response()` |
-| **Conversation context** | Follow-up detection; history injected into all agents automatically |
-| **User profile** | Name, interests, style — learned from conversation, persisted |
+| **Intent routing** | 2-stage: keyword regex → LLM classifier |
+| **RAG pre-check** | Vector store scan before any agent |
+| **Fallback loop** | Quality-gated chain with synthesis on total failure |
+| **Streaming responses** | Token-by-token via WebSocket / SSE |
+| **Conversation context** | Follow-up detection; history injected into all agents |
+| **User profile** | Name, interests, style — learned from conversation |
 | **Session recall** | Welcome-back recap after ≥ 4 hours away |
-| **Long-term memory** | Episodic fact extraction and cross-session recall (ChromaDB) |
-| **Task scheduling** | Natural-language recurring tasks ("remind me every hour") |
-| **File output** | Agents save results as .md / .py / .json / .csv / .docx |
+| **Long-term memory** | Episodic fact extraction, cross-session recall (ChromaDB) |
+| **Task scheduling** | Natural-language recurring tasks |
+| **File output** | Agents save .md / .py / .json / .csv / .docx |
 | **Code sandbox** | Expanded blocklist, env isolation, 64 KB output cap |
 | **PDF → Markdown** | UTF-8 normalisation + NFKC + heading-aware chunking |
 | **Mass document upload** | Split-lane parallel ingestion with dedup + dry-run |
 | **Document update** | SHA-256 hash comparison — replaces only changed documents |
-| **Multi-doc comparison** | Side-by-side retrieval from multiple documents |
+| **Multi-doc comparison** | Side-by-side retrieval across multiple documents |
 | **Table-aware retrieval** | Separates GFM pipe-table chunks from prose |
 | **Re-ranked search** | LLM scores DuckDuckGo results before returning top-k |
-| **JS-rendered pages** | Playwright headless Chromium — handles any modern web page |
+| **JS-rendered pages** | Playwright headless Chromium |
 | **Data analysis** | pandas + matplotlib — load CSV, run queries, plot charts |
-| **Writing assistant** | Outline → draft → edit → export DOCX/Markdown pipeline |
-| **Deep research** | Multi-turn plan→gather→evaluate→synthesise with reasoning model |
+| **Writing assistant** | Outline → draft → edit → export DOCX/Markdown |
+| **Deep research** | Multi-turn plan→gather→evaluate→synthesise |
 | **Voice I/O** | Whisper STT + pyttsx3 TTS (offline) |
 | **FastAPI server** | REST + WebSocket + SSE streaming |
 | **Plugin system** | Drop Python files in `plugins/` to add custom agents |
 | **Evaluation harness** | Built-in test suites + custom eval runner |
-| **Admin CLI** | Manage sessions, episodic memory, plugins, scheduled tasks |
 
 ---
 
@@ -514,76 +473,56 @@ Ollama server process, leaving application-side VRAM free for Docling and the LL
 ```
 virtual-assistant/
 ├── agents/
-│   ├── base_agent.py              AgentResponse · BaseAgent ABC · _ExecutorCompat
-│   ├── chat_agent.py              Direct LLM · streaming · memory injection
-│   ├── code_agent.py              5-task router: write/review/debug/execute/save
-│   ├── data_analysis_agent.py     pandas · matplotlib · auto-load · file refs  ← new
-│   ├── deep_research_agent.py     plan/gather/evaluate/synthesise · reasoning model
+│   ├── base_agent.py              AgentResponse · BaseAgent · _ExecutorCompat
+│   ├── chat_agent.py              streaming · memory injection
+│   ├── code_agent.py              write / review / debug / execute / save
+│   ├── data_analysis_agent.py     pandas · matplotlib · auto-load       ← new
+│   ├── deep_research_agent.py     plan → gather → evaluate → synthesise
 │   ├── document_agent.py          7 tools · compare/table fast-paths
-│   ├── financial_agent.py         8-task router · 70+ company name map · yfinance
-│   ├── news_agent.py              RSS + DuckDuckGo news
-│   ├── orchestrator.py            Intent enum · 2-stage routing · fallback loop
-│   │                              schedule detection · profile extraction
-│   ├── rag_precheck.py            KB scan before agents · _RAG_SKIP_INTENTS
+│   ├── financial_agent.py         8-task router · yfinance
+│   ├── news_agent.py              RSS + DuckDuckGo
+│   ├── orchestrator.py            Intent enum · routing · fallback loop
+│   ├── rag_precheck.py            KB scan · _RAG_SKIP_INTENTS
 │   ├── search_agent.py            4-route: math/URL/encyclopedic/research
-│   └── writing_agent.py           outline→draft→edit→export · fast path       ← new
+│   └── writing_agent.py           outline → draft → edit → export       ← new
 │
 ├── tools/
-│   ├── code_tools.py              CodeWriter · CodeReviewer · CodeExecutor (sandboxed)
-│   ├── data_analysis_tools.py     LoadData · InspectData · RunPandas · PlotData  ← new
-│   │                              ExportData · ListLoadedData
-│   ├── document_tools.py          IngestDocument · UpdateDocument · Search
-│   │                              TableSearch · CompareDocuments · BulkIngest
-│   ├── file_output_tools.py       SaveText · SaveCode · SaveJson · ListSaved
-│   ├── financial_tools.py         StockQuote · CompanyProfile · Ratios · History
+│   ├── code_tools.py              CodeWriter · CodeReviewer · CodeExecutor
+│   ├── data_analysis_tools.py     LoadData · RunPandas · PlotData · Export  ← new
+│   ├── document_tools.py          Ingest · Search · TableSearch · Compare
+│   ├── file_output_tools.py       SaveText · SaveCode · SaveJson
+│   ├── financial_tools.py         StockQuote · Ratios · History
 │   ├── news_tools.py              Headlines · TopicNews · RSSFeed
-│   ├── search_tools.py            DuckDuckGo · RankedSearch · Wikipedia
-│   │                              WebFetch · PlaywrightFetch · Calculator
-│   └── writing_tools.py           Outline · DraftSection · Assemble · Edit     ← new
-│                                  ExportMarkdown · ExportDocx · ListDrafts
+│   ├── search_tools.py            DuckDuckGo · RankedSearch · Playwright
+│   └── writing_tools.py           Outline · Draft · Assemble · ExportDocx  ← new
+│
+├── api/
+│   ├── auth.py                    SQLite users · bcrypt · JWT             ← new
+│   ├── server.py                  FastAPI · /auth/* · /chat · /ws · /ui
+│   ├── rate_limiter.py            sliding-window per-IP
+│   └── sse.py                     SSE streaming helpers
 │
 ├── document_processing/
-│   ├── docling_processor.py       3-stage pipeline: parse→markdown→utf8→chunk
-│   ├── document_manager.py        ingest_or_update · search_multi_doc
-│   │                              compare_documents · search_with_tables
+│   ├── docling_processor.py       parse → markdown → utf8 → chunk
+│   ├── document_manager.py        ingest_or_update · compare · tables
 │   ├── mass_uploader.py           split-lane parallel ingestion
-│   ├── type_detector.py           12 DocumentTypes · ExtractionStrategy
 │   └── vector_store.py            ChromaDB · batch_size · dedup
 │
 ├── core/
-│   ├── async_runner/              asyncio bridge
-│   ├── cache/                     ToolCache (TTL)
-│   ├── conversation_context.py    is_followup_query · build_conversation_context
-│   ├── llm_manager.py             get_llm · get_reasoning_llm · get_embeddings
-│   ├── logging/                   structured logging
+│   ├── conversation_context.py    follow-up detection · context injection
+│   ├── llm_manager.py             get_llm · get_embeddings
 │   ├── long_term_memory/          EpisodicMemory (ChromaDB)
 │   ├── memory/                    PersistentMemory · AssistantMemory
-│   ├── profile_extractor.py       extract_and_update_profile · build_session_recall
-│   ├── resilience/                retry · circuit breaker
+│   ├── profile_extractor.py       extract_and_update_profile · session_recall
 │   ├── scheduler/                 TaskScheduler (daemon thread)
-│   ├── summariser/                ConversationSummariser
-│   ├── tracing/                   Tracer (spans)
 │   ├── user_prefs/                UserPreferences (Pydantic · disk-persisted)
 │   ├── user_task_scheduler.py     UserTaskManager · parse_schedule()
-│   └── voice/                     Whisper STT · MicrophoneListener · TTS
+│   └── voice/                     Whisper STT · TTS
 │
-├── api/
-│   ├── server.py                  FastAPI · /chat · /stream (SSE) · /ws · /ui
-│   ├── rate_limiter.py            sliding-window per-IP
-│   └── streaming.py               SSE helpers
+├── ui/
+│   └── index.html                 SPA — login · chat · sidebars · 3D graph  ← new
 │
-├── config/
-│   ├── settings.py                Pydantic BaseSettings · all env vars
-│   └── __init__.py
-│
-├── evaluation/
-│   ├── harness.py                 EvalHarness · EvalCase · EvalResult
-│   ├── built_in_suites.py         routing · quality · tool · doc suites
-│   └── runner.py                  CLI eval runner
-│
-├── plugins/                       drop .py files here to add custom agents
-│
-├── tests/                         1,088 tests · 23 files · autouse LLM mock
+├── tests/                         1,088 tests · 23 files
 │   ├── conftest.py                no_real_llm autouse fixture
 │   ├── test_advanced_modules.py   (34)
 │   ├── test_agents.py             (19)
@@ -609,9 +548,9 @@ virtual-assistant/
 │   ├── test_voice.py              (4)
 │   └── test_web_capabilities.py   (28)
 │
-├── cli.py                         Typer CLI (ask · ingest · docs · transcribe · config)
+├── cli.py                         Typer CLI (ask · ingest · docs · config)
 ├── main.py                        REPL · streaming · :commands · session recall
-├── start.sh                       one-shot launcher (chat/voice/api/docker/test)
+├── start.sh                       launcher (chat/voice/api/web/docker/test)
 ├── .env                           all configuration
 ├── requirements.txt               Python dependencies
 └── README.md                      this file
@@ -622,15 +561,10 @@ virtual-assistant/
 ## Running Tests
 
 ```bash
-python -m pytest tests/ -v              # full suite (1,088 tests)
-python -m pytest tests/ -q              # quiet summary
-python -m pytest tests/test_new_agents.py -v   # new agents only
-python -m pytest tests/ -k "data"       # data analysis tests
-python -m pytest tests/ -k "writing"    # writing assistant tests
+python -m pytest tests/ -q           # full suite (1,088 tests)
+python -m pytest tests/test_api.py   # API tests only
+python -m pytest tests/ -k "auth"    # auth-related tests
 ```
-
-All LLM and external API calls are mocked via the `no_real_llm` autouse
-fixture in `conftest.py`. Tests run offline in seconds.
 
 ---
 
@@ -640,12 +574,18 @@ fixture in `conftest.py`. Tests run offline in seconds.
 |---|---|
 | Python | 3.10+ |
 | Ollama | Latest (auto-started by `start.sh`) |
-| RAM (minimum) | 8 GB (for `llama3.1:8b` + `nomic-embed-text`) |
-| RAM (recommended) | 16 GB (for parallel Docling + LLM inference) |
+| RAM (minimum) | 8 GB |
+| RAM (recommended) | 16 GB |
 | Disk | 10–20 GB (models + vector store) |
 | OS | Linux · macOS · Windows (WSL2) |
 
-Optional:
-- `ffmpeg` + `portaudio` — voice I/O
-- `playwright install chromium` — JS-rendered page fetching
-- Docker + Docker Compose — containerised deployment
+Optional system packages:
+
+```bash
+# Voice I/O
+sudo apt-get install ffmpeg portaudio19-dev   # Linux
+brew install ffmpeg portaudio                  # macOS
+
+# JS page fetching
+playwright install chromium
+```

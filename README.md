@@ -41,7 +41,7 @@ bash start.sh --help                                   # all options
 bash start.sh voice                                    # mic + TTS
 bash start.sh api                                      # FastAPI server on :8080
 bash start.sh docker                                   # full Docker Compose stack
-bash start.sh test                                     # run the 781-test suite
+bash start.sh test                                     # run the 1020-test suite
 bash start.sh --query "Explain recursion like I'm five"
 bash start.sh --ingest ./reports/
 bash start.sh --model llama3.2:3b                      # lighter model
@@ -62,6 +62,18 @@ bash start.sh --backend vllm api                       # GPU + API server
 | **Document Q&A** | Ingest PDF, DOCX, XLSX, PPTX, TXT, MD, CSV, HTML, JSON, XML |
 | **Mass document upload** | Concurrent batch ingestion with type detection, deduplication, and dry-run |
 | **PDF → Markdown pipeline** | Every document converted to UTF-8 Markdown before chunking; ligatures and control chars normalised |
+| **Streaming responses** | Token-by-token streaming in REPL via `Orchestrator.stream_response()` — no waiting for full response |
+| **Conversation context** | All agents receive prior conversation history; follow-up queries automatically detected and enriched |
+| **User profile** | Learns name, interests, and preferences from conversation; persists across sessions |
+| **Session recall** | Greets returning users with a recap of what was covered last time |
+| **Document update** | `ingest_or_update()` — SHA-256 hash comparison, replaces only changed documents |
+| **Multi-doc comparison** | `compare_documents()` — side-by-side retrieval from multiple documents simultaneously |
+| **Table-aware retrieval** | Separates GFM pipe-table chunks from prose for structured-data queries |
+| **File output** | Agents can save results as `.md`, `.py`, `.json`, `.csv` files to `data/uploads/generated/` |
+| **Hardened sandbox** | Code executor expanded blocklist, env isolation, 64 KB output cap |
+| **User task scheduling** | Natural-language scheduling: "remind me every hour", "send me the news daily" |
+| **Re-ranked web search** | LLM scores and re-ranks raw search results for relevance before returning |
+| **JS-rendered pages** | Playwright headless Chromium fetches SPAs and dynamic content (`:fetch_webpage_js`) |
 | **Financial analysis** | Stock quotes, ratios, statements, price history, comparisons via Yahoo Finance |
 | **Voice I/O** | Whisper STT (offline, 99 languages) + pyttsx3 TTS |
 | **Dual LLM backend** | Ollama (CPU) or vLLM (GPU) — swap with one env var |
@@ -105,7 +117,7 @@ bash start.sh --backend vllm api                       # GPU + API server
 │  └──────┴──────┴──────┴──────────┴──────────┴──────────┴──────────┘      │
 │                                                                          │
 │  RAG pre-check → quality gate → fallback chain → synthesis               │
-│  Post-processing: memory · episodic · summariser · tracing               `│
+│  Post-processing: memory · episodic · summariser · tracing               │
 └──────────────────────────────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────────────────────────┐
@@ -475,6 +487,105 @@ orch = Orchestrator(enable_llm_quality_check=True, max_fallback_attempts=3)
 
 ---
 
+## Memory & Personalisation
+
+### User profile
+The assistant learns your name, interests, and response style preferences from
+natural conversation — no configuration required.
+
+```
+You: My name is Alice and I prefer technical answers.
+Assistant: Got it, Alice. I'll keep responses technical going forward.
+```
+
+Profile is extracted in two passes: fast regex heuristics (`<1ms`, every turn)
+and LLM extraction (background thread, every 10th turn). Stored in
+`data/logs/user_prefs/<user_id>.json`.
+
+REPL commands: `:prefs` (view/update), `:memory` (long-term facts)
+
+### Session recall
+When you return after 4+ hours, the assistant greets you with a brief recap of
+what was covered last time using facts stored in episodic memory.
+
+### Long-term memory
+Episodic memory is enabled by default. After each response, the LLM extracts
+1–3 memorable facts ("Q3 revenue was $4.2B", "user works in fintech") and
+stores them in a dedicated ChromaDB collection. These facts are recalled
+automatically on relevant future queries.
+
+---
+
+## Task Scheduling
+
+Schedule recurring tasks using natural language:
+
+```
+You: Remind me to check Apple stock price every hour.
+You: Send me a news briefing every morning.
+You: Schedule a portfolio analysis every Friday.
+```
+
+The orchestrator detects scheduling patterns (`remind me`, `every X`, `schedule`,
+`send me … every`) and registers the task with the background scheduler. Tasks
+persist across restarts and run in their own Orchestrator sessions.
+
+Manage tasks with `:tasks` in the REPL or `python cli.py` tasks (via admin CLI).
+
+---
+
+## File Output
+
+Agents can save their output as files you can download or use directly:
+
+```
+You: Write a Python script to analyse the CSV and save it.
+You: Generate a Markdown report on this topic and save it.
+You: Export this data as JSON.
+```
+
+Files are saved to `data/uploads/generated/`. The `save_text_file`,
+`save_code_file`, and `save_json_file` tools are available in the CodeAgent.
+
+---
+
+## Web Capabilities
+
+### Re-ranked search (`ranked_web_search`)
+Fetches up to 8 raw results then uses the LLM to score and return only the
+most relevant ones. Use for research queries where precision matters.
+
+### JS-rendered pages (`fetch_webpage_js`)
+Headless Chromium (via Playwright) fetches pages that require JavaScript:
+SPAs, dynamic dashboards, login-gated content after interaction.
+
+```python
+# Agents can call either tool:
+# web_search          — fast DuckDuckGo, returns raw results
+# ranked_web_search   — slower, but higher-quality re-ranked results
+# fetch_webpage       — simple HTTP fetch (fast, no JS)
+# fetch_webpage_js    — Playwright headless fetch (handles any modern page)
+```
+
+Playwright requires Chromium to be installed:
+```bash
+playwright install chromium
+```
+
+---
+
+## Conversation Context
+
+All specialist agents (Search, Code, Finance, News, Document) now receive
+recent conversation history when a follow-up is detected. Follow-up detection
+identifies:
+
+- Short queries (≤ 4 words): `"why?"`, `"how?"`, `"and then?"`
+- Referential pronouns: `"it"`, `"this"`, `"that"`, `"the code above"`
+- Continuation words: `"but"`, `"so"`, `"also"`, `"additionally"`
+
+Context is prepended automatically — no user action required.
+
 ## Document Preprocessing Pipeline
 
 Every document passes through a three-stage pipeline before being stored in
@@ -638,7 +749,7 @@ Modes
   voice     REPL with Whisper STT + TTS
   api       FastAPI server on :8080
   docker    Full Docker Compose stack
-  test      Run the 781-test suite
+  test      Run the 1020-test suite
 
 Options
   --query  TEXT   Single query, print response, exit
@@ -661,6 +772,7 @@ python cli.py ask "Hello!"                          --agent chat
 python cli.py ask "Apple stock P/E ratio"           --agent finance
 python cli.py ask "Research climate change"         --agent research
 python cli.py ask "What is CRISPR?" --no-rag        # skip RAG pre-check
+python cli.py ask "Apple P/E ratio" --user alice    # user profile aware
 
 python cli.py ingest report.pdf
 python cli.py ingest ./docs/ --directory --workers 4
@@ -690,6 +802,9 @@ python cli.py config                                # show all settings
 | `:history` | Show recent conversation |
 | `:voice` | Toggle voice I/O |
 | `:rag on/off` | Enable or disable the RAG pre-check |
+| `:prefs` | Show your user profile and learned preferences |
+| `:memory` | Show stored long-term facts from past sessions |
+| `:tasks` | Show and manage your scheduled recurring tasks |
 
 ### `admin/admin_cli.py`
 
@@ -821,6 +936,10 @@ Response:
 | `RATE_LIMIT_REQUESTS` | `60` | API requests per window |
 | `RATE_LIMIT_WINDOW` | `60` | Window in seconds |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
+
+> **Note:** `EMBEDDING_BACKEND=ollama` is now the default in `.env` to avoid
+> CUDA OOM errors during document ingestion. Set `EMBEDDING_BACKEND=huggingface`
+> to restore the previous behaviour. See **Embedding Backends** for details.
 
 ### Recommended models
 
@@ -992,7 +1111,7 @@ docker compose run -it --rm assistant
 
 ```bash
 make install-dev    # venv + all deps + dev extras
-make test           # 781 tests
+make test           # 1020 tests
 make test-cov       # with HTML coverage → data/coverage/
 make test-unit      # unit tests only
 make test-api       # API tests only
@@ -1026,7 +1145,9 @@ virtual-assistant/
 │   ├── financial_agent.py              8-task router, company-name resolution, yfinance
 │   ├── deep_research_agent.py          plan→gather→evaluate→synthesise multi-turn loop
 │   ├── rag_precheck.py                 KB scan before agents; returns RAG answer or None
-│   └── orchestrator.py                 Intent enum · 2-stage routing · fallback loop
+│   ├── orchestrator.py                 Intent enum · 2-stage routing · fallback loop
+│   │                                   schedule detection · profile extraction
+│   └── rag_precheck.py                 KB scan before agents; returns RAG answer or None
 │                                       RAG pre-check · quality gates · synthesis
 │                                       fallback chains · LangGraph graph
 │                                       RESEARCH intent → DeepResearchAgent
@@ -1043,6 +1164,9 @@ virtual-assistant/
 │   ├── summariser/                     ConversationSummariser (rolling compression)
 │   ├── tracing/                        Tracer · Span · TraceStore (JSONL)
 │   ├── user_prefs/                     UserPreferences (Pydantic, disk-persisted)
+│   ├── conversation_context.py         follow-up detection · context injection helpers
+│   ├── profile_extractor.py            learns name/interests/prefs from conversation
+│   └── user_task_scheduler.py          per-user scheduled tasks · parse_schedule()
 │   └── voice/                          Whisper STT · MicrophoneListener · pyttsx3 TTS
 │
 ├── document_processing/
@@ -1062,8 +1186,10 @@ virtual-assistant/
 │   ├── financial_tools.py              StockQuote · CompanyInfo · Statements · Ratios
 │   │                                   PriceHistory · StockComparison
 │   │                                   yfinance primary · LLM knowledge fallback
+│   ├── file_output_tools.py            SaveText · SaveCode · SaveJson · ListSaved
 │   ├── news_tools.py                   Headlines · TopicNews · RSSFeed
-│   └── search_tools.py                 DuckDuckGo · Wikipedia · WebFetch · Calculator
+│   └── search_tools.py                 DuckDuckGo · RankedSearch · Wikipedia
+│                                       WebFetch · PlaywrightFetch · Calculator
 │
 ├── api/
 │   ├── server.py                       FastAPI app · all endpoints · bulk-ingest route
@@ -1088,7 +1214,7 @@ virtual-assistant/
 │   └── admin_cli.py                    sessions · kb · kb bulk · traces
 │                                       cache · prefs · scheduler · health
 │
-├── tests/                              781 tests · 18 test files · autouse LLM mock
+├── tests/                              1020 tests · 22 test files · autouse LLM mock
 │   ├── conftest.py
 │   ├── test_agents.py                  (19)
 │   ├── test_advanced_modules.py        (34)
@@ -1096,6 +1222,7 @@ virtual-assistant/
 │   ├── test_chat_agent.py              (33)
 │   ├── test_deep_research_agent.py     (72)
 │   ├── test_document_processing.py     (15)
+│   ├── test_conversation_and_docs.py   (43)
 │   ├── test_embedding_backends.py      (47)
 │   ├── test_final_modules.py           (25)
 │   ├── test_financial_agent.py         (56)
@@ -1104,9 +1231,12 @@ virtual-assistant/
 │   ├── test_new_modules.py             (41)
 │   ├── test_orchestrator.py            (86)
 │   ├── test_preprocessing_pipeline.py  (62)
+│   ├── test_memory_personalisation.py  (49)
 │   ├── test_rag_precheck.py            (49)
 │   ├── test_rate_limiter.py            (18)
+│   ├── test_task_execution.py          (41)
 │   ├── test_tools.py                   (23)
+│   ├── test_web_capabilities.py        (28)
 │   └── test_voice.py                   (4)
 │
 ├── scripts/

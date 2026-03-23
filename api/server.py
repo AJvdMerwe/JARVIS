@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import (
-    Depends, FastAPI, File, Form, HTTPException, Query,
+    Depends, FastAPI, File, Form, HTTPException, Query, Request,
     UploadFile, WebSocket, WebSocketDisconnect,
 )
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -38,9 +38,14 @@ from pydantic import BaseModel, Field
 
 from agents import AgentResponse, Orchestrator
 from api.auth import (
-    TokenResponse, UserCreate, UserOut,
-    authenticate_user, create_access_token, create_user,
-    decode_token, get_user_by_id, init_db,
+    AdminPasswordReset, PasswordChange, TokenResponse,
+    UserCreate, UserOut, UserUpdate,
+    admin_create_user, admin_reset_password,
+    authenticate_user, change_password, create_access_token,
+    create_user, delete_user, get_login_stats, get_user_by_id,
+    create_access_token, decode_token,
+    init_db, list_users, registration_open, set_user_active,
+    set_user_role, update_user_profile, user_count,
 )
 from api.rate_limiter import RateLimitMiddleware
 from api.sse import router as sse_router
@@ -210,13 +215,13 @@ async def _chat_trace(tracer, session_id: str, query: str) -> _AsyncGen:
 
 
 # =============================================================================
-#  Authentication endpoints
+#  Auth helpers
 # =============================================================================
 
 def _get_current_user(
     creds: HTTPAuthorizationCredentials = Depends(_bearer),
 ) -> UserOut:
-    """FastAPI dependency — validate Bearer JWT and return the user."""
+    """FastAPI dependency — validate Bearer JWT, return active UserOut."""
     if creds is None:
         raise HTTPException(status_code=401, detail="Not authenticated")
     payload = decode_token(creds.credentials)
@@ -224,40 +229,219 @@ def _get_current_user(
         raise HTTPException(status_code=401, detail="Invalid or expired token")
     user = get_user_by_id(int(payload["sub"]))
     if user is None:
-        raise HTTPException(status_code=401, detail="User not found")
+        raise HTTPException(status_code=401, detail="User account not found")
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="Account is deactivated")
     return user
 
+
+def _require_admin(current_user: UserOut = Depends(_get_current_user)) -> UserOut:
+    """FastAPI dependency — ensure caller is an admin."""
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Administrator access required")
+    return current_user
+
+
+def _user_or_404(user_id: int) -> UserOut:
+    user = get_user_by_id(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail=f"User {user_id} not found")
+    return user
+
+
+# =============================================================================
+#  Auth endpoints
+# =============================================================================
 
 class LoginRequest(BaseModel):
     username: str
     password: str
 
 
+@app.get("/auth/config", tags=["Auth"])
+async def auth_config() -> dict:
+    """Return public auth settings the UI needs before login."""
+    return {"open_registration": registration_open()}
+
+
 @app.post("/auth/register", response_model=TokenResponse, tags=["Auth"])
-async def register(data: UserCreate) -> TokenResponse:
+async def register(data: UserCreate, request: Request) -> TokenResponse:
     """Register a new user account and receive a JWT."""
     try:
         user = create_user(data)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     token = create_access_token(user)
-    return TokenResponse(access_token=token, username=user.username, user_id=user.id)
+    logger.info("New registration: '%s' from %s", user.username, request.client.host)
+    return TokenResponse(
+        access_token=token,
+        username=user.username,
+        display_name=user.display_name,
+        user_id=user.id,
+        role=user.role,
+        avatar_color=user.avatar_color,
+    )
 
 
 @app.post("/auth/login", response_model=TokenResponse, tags=["Auth"])
-async def login(data: LoginRequest) -> TokenResponse:
+async def login(data: LoginRequest, request: Request) -> TokenResponse:
     """Authenticate with username + password and receive a JWT."""
-    user = authenticate_user(data.username, data.password)
+    ip   = request.client.host if request.client else ""
+    user = authenticate_user(data.username, data.password, ip=ip)
     if user is None:
-        raise HTTPException(status_code=401, detail="Invalid username or password")
+        raise HTTPException(status_code=401, detail="Invalid username or password, or account locked")
     token = create_access_token(user)
-    return TokenResponse(access_token=token, username=user.username, user_id=user.id)
+    return TokenResponse(
+        access_token=token,
+        username=user.username,
+        display_name=user.display_name,
+        user_id=user.id,
+        role=user.role,
+        avatar_color=user.avatar_color,
+    )
 
 
 @app.get("/auth/me", response_model=UserOut, tags=["Auth"])
 async def me(current_user: UserOut = Depends(_get_current_user)) -> UserOut:
     """Return the currently authenticated user's profile."""
     return current_user
+
+
+@app.patch("/auth/me", response_model=UserOut, tags=["Auth"])
+async def update_me(
+    data:         UserUpdate,
+    current_user: UserOut = Depends(_get_current_user),
+) -> UserOut:
+    """Update the authenticated user's display name or email."""
+    try:
+        return update_user_profile(current_user.id, data)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/auth/change-password", tags=["Auth"])
+async def change_my_password(
+    data:         PasswordChange,
+    current_user: UserOut = Depends(_get_current_user),
+) -> dict:
+    """Change the authenticated user's password."""
+    ok = change_password(current_user.id, data)
+    if not ok:
+        raise HTTPException(status_code=400, detail="Current password is incorrect")
+    return {"message": "Password changed successfully"}
+
+
+# =============================================================================
+#  Admin — user management
+# =============================================================================
+
+@app.get("/admin/users", tags=["Admin"])
+async def admin_list_users(
+    search:           str  = "",
+    include_inactive: bool = False,
+    limit:            int  = 100,
+    offset:           int  = 0,
+    _admin:           UserOut = Depends(_require_admin),
+) -> dict:
+    """List all users. Admin only."""
+    users  = list_users(include_inactive=include_inactive, search=search, limit=limit, offset=offset)
+    counts = user_count()
+    return {"users": [u.model_dump() for u in users], "counts": counts}
+
+
+@app.post("/admin/users", tags=["Admin"])
+async def admin_add_user(
+    data:   UserCreate,
+    role:   str  = "user",
+    active: bool = True,
+    _admin: UserOut = Depends(_require_admin),
+) -> dict:
+    """Create a user account directly (bypasses open_registration flag). Admin only."""
+    try:
+        user = admin_create_user(data, role=role, is_active=active)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"user": user.model_dump(), "message": f"User '{user.username}' created"}
+
+
+@app.patch("/admin/users/{user_id}/activate", tags=["Admin"])
+async def admin_activate(
+    user_id: int,
+    active:  bool = True,
+    _admin:  UserOut = Depends(_require_admin),
+) -> dict:
+    """Activate or deactivate a user account. Admin only."""
+    user = _user_or_404(user_id)
+    if user_id == _admin.id:
+        raise HTTPException(status_code=400, detail="Cannot deactivate your own account")
+    ok = set_user_active(user_id, active)
+    state = "activated" if active else "deactivated"
+    return {"message": f"User '{user.username}' {state}"}
+
+
+@app.patch("/admin/users/{user_id}/role", tags=["Admin"])
+async def admin_set_role(
+    user_id: int,
+    role:    str,
+    _admin:  UserOut = Depends(_require_admin),
+) -> dict:
+    """Promote or demote a user (role: user|admin). Admin only."""
+    if role not in ("user", "admin"):
+        raise HTTPException(status_code=400, detail="Role must be 'user' or 'admin'")
+    user = _user_or_404(user_id)
+    if user_id == _admin.id and role == "user":
+        raise HTTPException(status_code=400, detail="Cannot demote your own account")
+    set_user_role(user_id, role)
+    return {"message": f"User '{user.username}' is now a {role}"}
+
+
+@app.post("/admin/users/{user_id}/reset-password", tags=["Admin"])
+async def admin_do_reset_password(
+    user_id: int,
+    data:    AdminPasswordReset,
+    _admin:  UserOut = Depends(_require_admin),
+) -> dict:
+    """Reset any user's password. Admin only."""
+    user = _user_or_404(user_id)
+    ok   = admin_reset_password(user_id, data)
+    if not ok:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"message": f"Password reset for '{user.username}'"}
+
+
+@app.delete("/admin/users/{user_id}", tags=["Admin"])
+async def admin_delete_user(
+    user_id: int,
+    _admin:  UserOut = Depends(_require_admin),
+) -> dict:
+    """Permanently delete a user account. Admin only."""
+    if user_id == _admin.id:
+        raise HTTPException(status_code=400, detail="Cannot delete your own account")
+    user = _user_or_404(user_id)
+    ok   = delete_user(user_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="User not found")
+    logger.info("Admin '%s' deleted user '%s' (id=%d)", _admin.username, user.username, user_id)
+    return {"message": f"User '{user.username}' permanently deleted"}
+
+
+@app.get("/admin/users/{user_id}/stats", tags=["Admin"])
+async def admin_user_stats(
+    user_id: int,
+    days:    int  = 7,
+    _admin:  UserOut = Depends(_require_admin),
+) -> dict:
+    """Return login statistics for a user. Admin only."""
+    _user_or_404(user_id)
+    return get_login_stats(user_id, days=days)
+
+
+@app.get("/admin/stats", tags=["Admin"])
+async def admin_global_stats(
+    _admin: UserOut = Depends(_require_admin),
+) -> dict:
+    """Return global user counts. Admin only."""
+    return user_count()
 
 
 @app.get("/health", response_model=HealthResponse, tags=["System"])

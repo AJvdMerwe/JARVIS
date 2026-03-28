@@ -28,6 +28,8 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 @pytest.fixture(autouse=True)
 def no_real_llm(monkeypatch):
+    # Disable the backend connectivity probe in all tests — no server needed
+    monkeypatch.setenv("LLM_BACKEND_SKIP_PROBE", "true")
     """
     Prevent any test from accidentally calling a real LLM.
     Tests that need LLM behaviour should mock get_llm() themselves.

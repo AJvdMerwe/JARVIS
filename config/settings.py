@@ -39,8 +39,22 @@ class Settings(BaseSettings):
     vllm_model: str = "mistralai/Mistral-7B-Instruct-v0.2"
     vllm_api_key: str = "EMPTY"
 
+    # ── SGLang ──────────────────────────────────────────────────────────────
+    # SGLang exposes an Ollama-compatible API (/api/chat, /api/generate).
+    # Start with: python -m sglang.launch_server --model <hf_model> --port 11435
+    #
+    # Use port 11435 to avoid conflict with a real Ollama server on 11434.
+    # The Ollama-compat endpoints are at http://localhost:11435/api/chat etc.
+    # No API key needed — same as Ollama.
+    sglang_base_url: str = "http://localhost:11435"
+    sglang_model: str = "meta-llama/Llama-3.1-8B-Instruct"
+    # SGLang-specific optimisations (applied server-side via launch flags)
+    sglang_enable_speculative: bool = False
+    sglang_max_prefill_tokens: int = Field(16384, ge=1024)
+    sglang_num_predict: int = Field(2048, ge=64)    # mirrors Ollama num_predict
+
     # ── Backend selector ────────────────────────────────────────────────────
-    llm_backend: Literal["ollama", "vllm"] = "ollama"
+    llm_backend: Literal["ollama", "vllm", "sglang"] = "ollama"
 
     # ── Whisper ─────────────────────────────────────────────────────────────
     whisper_model: Literal["tiny", "base", "small", "medium", "large"] = "base"

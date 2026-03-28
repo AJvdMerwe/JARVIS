@@ -56,7 +56,16 @@ lxml>=5.2.2
 playwright>=1.44.0              # Headless Chromium for JS-rendered pages
                                 # After install run: playwright install chromium
 
-# ─── Financial data ──────────────────────────────────────────────────────────
+
+# ─── Inference backends ───────────────────────────────────────────────────────
+# sglang — high-performance inference server (RadixAttention, chunked prefill,
+#           speculative decoding). Requires CUDA 12+ GPU and PyTorch.
+# Install: pip install sglang[all]
+# NOTE: sglang is OPTIONAL — the system falls back to ollama automatically.
+#       Uncomment the line below only on GPU servers.
+# sglang[all]>=0.3.0
+
+# ─── Financial data ───────────────────────────────────────────────────────────
 yfinance>=0.2.40                # Yahoo Finance — stock quotes, history, ratios
 
 # ─── Data & config ───────────────────────────────────────────────────────────

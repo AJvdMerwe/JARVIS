@@ -62,6 +62,7 @@ while [[ $# -gt 0 ]]; do
       echo "  chat            Interactive text REPL (default)"
       echo "  voice           REPL with Whisper STT + TTS"
       echo "  api             FastAPI server (REST + WebSocket + SSE)"
+  echo "  benchmark       Run inference benchmark (compare backends)"
   echo "  web             Full web app with login UI — open browser to http://localhost:8080/ui/"
       echo "  docker          Full Docker Compose stack"
       echo "  test            Run the test suite (844 tests)"
@@ -69,7 +70,7 @@ while [[ $# -gt 0 ]]; do
       echo "Options:"
       echo "  --query  TEXT   Run a single query and exit"
       echo "  --ingest PATH   Ingest a document or directory"
-      echo "  --backend NAME  LLM backend: ollama | vllm"
+      echo "  --backend NAME  LLM backend: ollama | vllm | sglang"
       echo "  --model  TAG    Ollama model tag (e.g. llama3.2:3b)"
       echo "  --port   INT    API server port (default: 8080)"
       echo "  --fresh         Force re-install of dependencies"
@@ -81,7 +82,7 @@ while [[ $# -gt 0 ]]; do
       echo "  bash start.sh --ingest ./reports/ --mode chat"
       echo "  bash start.sh --backend vllm voice"
       exit 0 ;;
-    chat|voice|api|web|docker|test)
+    chat|voice|api|web|sglang|benchmark|docker|test)
                   MODE="$1";        shift   ;;
     *)
       echo -e "${RED}Unknown argument: $1${RESET}"
@@ -198,7 +199,8 @@ setup_env() {
     else
       warn ".env.example not found — creating minimal .env"
       cat > "$env_file" << 'ENVEOF'
-LLM_BACKEND=ollama
+# LLM_BACKEND defaults to ollama only if not already set in environment or .env
+LLM_BACKEND="${LLM_BACKEND:-ollama}"
 OLLAMA_BASE_URL=http://localhost:11434
 OLLAMA_MODEL=llama3.1:8b
 OLLAMA_EMBEDDING_MODEL=nomic-embed-text
@@ -418,6 +420,125 @@ launch_web() {
     --log-level info
 }
 
+
+launch_benchmark() {
+  echo ""
+  echo -e "${BOLD}${CYAN}Running inference benchmark…${RESET}"
+  echo -e "${DIM}  Backends: ${BENCHMARK_BACKENDS:-ollama}"
+  echo -e "  Results will be saved to: data/benchmarks/${RESET}"
+  echo ""
+  python -m evaluation.inference_benchmark \
+    --backends ${BENCHMARK_BACKENDS:-ollama} \
+    --runs "${BENCHMARK_RUNS:-5}" \
+    --warmup "${BENCHMARK_WARMUP:-1}"
+}
+
+launch_sglang() {
+  # ── Mode: "bash start.sh sglang" — launches the SGLang server only ───────
+  echo ""
+  echo -e "${BOLD}${CYAN}Starting SGLang inference server…${RESET}"
+  if ! python -c "import sglang" 2>/dev/null; then
+    echo ""
+    echo -e "${RED}ERROR: sglang is not installed.${RESET}"
+    echo -e "  Run: ${BOLD}pip install sglang[all]${RESET}"
+    echo -e "  (Requires CUDA 12+ and PyTorch)"
+    exit 1
+  fi
+  # Derive port from SGLANG_BASE_URL (e.g. http://localhost:11435 → 11435)
+  local sglang_port
+  sglang_port=$(python -c "
+import os; u = os.environ.get('SGLANG_BASE_URL','http://localhost:11435')
+try:
+    from urllib.parse import urlparse; print(urlparse(u).port or 11435)
+except Exception: print(11435)
+")
+  local sglang_model="${SGLANG_MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
+
+  echo -e "${DIM}  Model  : ${sglang_model}"
+  echo -e "  Port   : ${sglang_port}"
+  echo -e "  URL    : http://localhost:${sglang_port}  (Ollama-compat API)${RESET}"
+  echo ""
+
+  # Build arg list
+  local sglang_args=(
+    --model-path   "${sglang_model}"
+    --host         "0.0.0.0"
+    --port         "${sglang_port}"
+    --trust-remote-code
+  )
+  [[ -n "${SGLANG_MEM_FRACTION:-}"        ]] && sglang_args+=(--mem-fraction-static "${SGLANG_MEM_FRACTION}")
+  [[ -n "${SGLANG_MAX_PREFILL_TOKENS:-}"  ]] && sglang_args+=(--max-prefill-tokens  "${SGLANG_MAX_PREFILL_TOKENS}")
+  [[ "${SGLANG_ENABLE_SPECULATIVE:-false}" == "true" ]] && {
+    sglang_args+=(--speculative-algo EAGLE)
+    [[ -n "${SGLANG_DRAFT_MODEL:-}" ]] && sglang_args+=(--speculative-draft-model-path "${SGLANG_DRAFT_MODEL}")
+  }
+
+  exec python -m sglang.launch_server "${sglang_args[@]}"
+}
+
+ensure_sglang() {
+  # ── Called before launching the app when LLM_BACKEND=sglang ──────────────
+  # Derives the URL from the environment and probes /api/tags.
+  # Fails hard if SGLang is not reachable — never falls back to Ollama.
+  local backend="${LLM_BACKEND:-$(grep -m1 '^LLM_BACKEND=' "${SCRIPT_DIR}/.env" 2>/dev/null | cut -d= -f2 | tr -d ' "' || echo 'ollama')}"
+  [[ "$backend" != "sglang" ]] && return 0
+
+  local sglang_url
+  sglang_url="${SGLANG_BASE_URL:-$(grep -m1 '^SGLANG_BASE_URL=' "${SCRIPT_DIR}/.env" 2>/dev/null | cut -d= -f2 | tr -d ' "' || echo 'http://localhost:11435')}"
+
+  local probe_url="${sglang_url%/}/api/tags"
+
+  echo -e "${DIM}  Checking SGLang server at ${sglang_url}…${RESET}"
+
+  local waited=0
+  local max_wait=10   # seconds — SGLang should already be running
+  until curl -sf "${probe_url}" &>/dev/null; do
+    sleep 1; (( waited++ ))
+    if (( waited >= max_wait )); then
+      echo ""
+      echo -e "${RED}${BOLD}ERROR: SGLang server not reachable at ${sglang_url}${RESET}"
+      echo ""
+      echo -e "  LLM_BACKEND=sglang is set but the SGLang server is not running."
+      echo -e "  Start it in a separate terminal first:"
+      echo ""
+      echo -e "    ${BOLD}bash start.sh sglang${RESET}"
+      echo ""
+      echo -e "  Or start it manually:"
+      echo -e "    ${DIM}python -m sglang.launch_server \\"
+      echo -e "        --model-path \${SGLANG_MODEL:-meta-llama/Llama-3.1-8B-Instruct} \\"
+      echo -e "        --port 11435 --host 0.0.0.0 --trust-remote-code${RESET}"
+      echo ""
+      echo -e "  ${BOLD}Jarvis will NOT fall back to Ollama when --backend sglang is set.${RESET}"
+      echo ""
+      exit 1
+    fi
+    echo -e "  ${DIM}Waiting for SGLang… (${waited}s)${RESET}"
+  done
+
+  ok "SGLang server ready at ${sglang_url}"
+}
+
+launch_benchmark() {
+  echo ""
+  echo -e "Running inference benchmark..."
+  BACKENDS="${BENCHMARK_BACKENDS:-ollama}"
+  SUITES="${BENCHMARK_SUITES:-short,medium}"
+  python -c "
+import sys, os
+sys.path.insert(0, '.')
+from core.benchmark import run_full_benchmark, format_report, save_report
+backends = os.environ.get('BENCHMARK_BACKENDS','ollama').split(',')
+suites   = os.environ.get('BENCHMARK_SUITES','short,medium').split(',')
+print('Benchmarking:', backends)
+results  = run_full_benchmark(backends=backends, suites=suites, warmup_runs=1)
+report   = format_report(results)
+print(report)
+md, js   = save_report(results)
+print('Report:', md)
+print('JSON:  ', js)
+"
+}
+
 launch_chat() {
   echo ""
   echo -e "${BOLD}${CYAN}Starting interactive REPL…${RESET}"
@@ -526,6 +647,7 @@ main() {
 
   # ── Setup steps (always run, fast if already done) ──────────────────────
   check_python
+  ensure_sglang
 
   # Docker mode skips Python setup entirely
   if [[ "$MODE" == "docker" ]]; then
@@ -565,8 +687,9 @@ main() {
     chat)   launch_chat   ;;
     voice)  launch_voice  ;;
     api)    launch_api    ;;
-    web)    launch_web    ;;
-    test)   launch_test   ;;
+    web)       launch_web       ;;
+    benchmark) export LLM_BACKEND_SKIP_PROBE=true; launch_benchmark ;;
+    test)      export LLM_BACKEND_SKIP_PROBE=true; launch_test      ;;
     *)      fail "Unknown mode: ${MODE}" ;;
   esac
 }

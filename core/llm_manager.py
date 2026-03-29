@@ -100,7 +100,7 @@ def require_backend(raise_on_fail: bool = True) -> bool:
             f"    bash start.sh sglang   (managed mode)\n"
             f"  or manually:\n"
             f"    python -m sglang.launch_server \\\n"
-            f"        --model-path {settings.sglang_model} \\\n"
+            f"        --model-path {settings.sglang_model}B \\\n"
             f"        --port {settings.sglang_base_url.split(':')[-1].split('/')[0]} \\\n"
             f"        --host 0.0.0.0 --trust-remote-code\n"
         )

@@ -10,23 +10,32 @@ Runs entirely on your machine — no data leaves your network.
 ## Quick Start
 
 ```bash
-# 1. Pull required Ollama models
+# ── Ollama setup (CPU / low-VRAM) ─────────────────────────────────────────────
 ollama pull llama3.1:8b           # chat and all general agents
 ollama pull nomic-embed-text      # document embeddings
 ollama pull deepseek-r1:7b        # deep research reasoning model
-
-# 2. Install Playwright browser (JS-rendered page fetching)
-playwright install chromium
-
-# 3. Install dependencies
+playwright install chromium       # JS-rendered page fetching (one-time)
 pip install -r requirements.txt
 
-# 4. Launch — choose your mode
-bash start.sh web                 # full web app  →  http://localhost:8080/ui/
-bash start.sh                     # interactive terminal REPL
+bash start.sh web                 # web app  →  http://localhost:8080/ui/
+bash start.sh                     # interactive REPL
 bash start.sh api                 # REST + WebSocket API only
-bash start.sh --query "What is CRISPR?"  # single-shot query
-bash start.sh --ingest ./docs/    # ingest a directory
+bash start.sh --query "What is CRISPR?"
+
+# ── SGLang setup (GPU — higher throughput, lower latency) ─────────────────────
+pip install sglang[all]           # requires CUDA 12+, ≥ 8 GB VRAM
+huggingface-cli login             # if using a gated model
+
+# Managed stack — starts server + web UI in one command:
+bash start.sh sglang                      # SGLang server + web UI  (default)
+bash start.sh sglang --app-mode api       # SGLang server + REST API
+bash start.sh sglang --app-mode chat      # SGLang server + REPL
+bash start.sh sglang --app-mode voice     # SGLang server + voice REPL
+
+# Or run the server standalone (separate terminal):
+bash scripts/start_sglang.sh
+# Then in another terminal:
+bash start.sh web     # with LLM_BACKEND=sglang in .env
 ```
 
 Default web credentials: **admin / admin123** — change immediately via the Register tab.
@@ -314,6 +323,84 @@ Headless Chromium via Playwright — handles SPAs, dynamic dashboards, cookie ba
 playwright install chromium   # one-time setup
 ```
 
+
+---
+
+## SGLang Inference Backend
+
+SGLang is a high-performance inference server that provides significantly higher
+throughput and lower latency than Ollama for GPU workloads.
+
+### Why SGLang
+
+| Feature | Ollama | vLLM | SGLang |
+|---|---|---|---|
+| CPU support | ✓ | — | — |
+| Easy setup | ✓ | — | — |
+| RadixAttention (prefix cache) | — | — | ✓ |
+| Chunked prefill | — | partial | ✓ |
+| EAGLE speculative decoding | — | — | ✓ |
+| Ollama-compatible API | native | — | ✓ |
+| Multi-user throughput | low | high | highest |
+
+**RadixAttention** reuses the KV-cache of shared prompt prefixes across requests.
+For RAG workloads (where every request has the same long system prompt), this
+typically reduces latency by 2–5× after the first request.
+
+### Setup
+
+```bash
+pip install sglang[all]   # requires CUDA 12+ and PyTorch
+
+# Optional: pre-download the model
+huggingface-cli download meta-llama/Llama-3.1-8B-Instruct
+```
+
+### Configuration (`.env`)
+
+```env
+LLM_BACKEND=sglang
+SGLANG_BASE_URL=http://localhost:11435   # port 11435 avoids clash with Ollama on 11434
+SGLANG_MODEL=meta-llama/Llama-3.1-8B-Instruct
+SGLANG_MEM_FRACTION=0.85                # GPU VRAM fraction (default 0.85)
+SGLANG_MAX_PREFILL_TOKENS=16384
+SGLANG_NUM_PREDICT=2048
+SGLANG_ENABLE_SPECULATIVE=false          # true = EAGLE draft-model speedup
+SGLANG_DRAFT_MODEL=                      # lmsys/sglang-EAGLE-Llama3.1-Instruct-8B
+```
+
+### Launch modes
+
+```bash
+# Managed stack (recommended) — server + app in one command
+bash start.sh sglang                     # + web UI  →  http://localhost:8080/ui/
+bash start.sh sglang --app-mode api      # + REST API
+bash start.sh sglang --app-mode chat     # + interactive REPL
+bash start.sh sglang --app-mode voice    # + voice REPL
+
+# Standalone server (then run app separately)
+bash scripts/start_sglang.sh             # blocks; Ctrl-C to stop
+bash scripts/start_sglang.sh --model Qwen/Qwen2.5-7B-Instruct
+bash scripts/start_sglang.sh --quantization fp8    # 4× less VRAM
+bash scripts/start_sglang.sh --speculative \
+    --draft-model lmsys/sglang-EAGLE-Llama3.1-Instruct-8B
+bash scripts/start_sglang.sh --dry-run  # print command without running
+
+# Benchmark — compare Ollama vs SGLang
+bash start.sh benchmark   # with BENCHMARK_BACKENDS="ollama sglang"
+python -m evaluation.inference_benchmark --backends ollama sglang --runs 10
+```
+
+### No silent fallback
+
+When `LLM_BACKEND=sglang` is set, Jarvis will **not** fall back to Ollama.
+If the SGLang server is not reachable at startup, the application exits with
+a clear error message rather than silently using a different backend.
+
+The `require_backend()` function in `core/llm_manager.py` probes the server
+at `SGLANG_BASE_URL/api/tags` before creating the LangChain model instance.
+Set `LLM_BACKEND_SKIP_PROBE=true` to disable this check (used in tests).
+
 ---
 
 ## REPL Commands
@@ -437,6 +524,8 @@ python cli.py config
 | Feature | Detail |
 |---|---|
 | **Web UI** | Login · chat · history sidebar · resources sidebar · 3D graph |
+| **SGLang backend** | Ollama-compatible API · RadixAttention · chunked prefill · speculative decoding |
+| **No-fallback guarantee** | `LLM_BACKEND=sglang` → hard error if server is down, never silently uses Ollama |
 | **JWT authentication** | SQLite user DB, bcrypt hashing, HS256 tokens, 24 h expiry |
 | **3D relationship graph** | Three.js — orbit/zoom/hover, Fibonacci layout, auto-rotate |
 | **9 specialist agents** | Chat · Code · News · Search · Document · Finance · Research · Data · Writing |

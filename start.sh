@@ -452,7 +452,7 @@ try:
     from urllib.parse import urlparse; print(urlparse(u).port or 11435)
 except Exception: print(11435)
 ")
-  local sglang_model="${SGLANG_MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
+  local sglang_model="${SGLANG_MODEL:Qwen/Qwen3-0.6B}"
 
   echo -e "${DIM}  Model  : ${sglang_model}"
   echo -e "  Port   : ${sglang_port}"

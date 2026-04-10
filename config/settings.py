@@ -35,9 +35,15 @@ class Settings(BaseSettings):
     research_chunk_budget: int = Field(6000, ge=1000, le=20000)
 
     # ── vLLM ────────────────────────────────────────────────────────────────
+    # vLLM exposes an OpenAI-compatible API (/v1/chat/completions).
+    # Start with: bash scripts/start_vllm.sh  or  bash start.sh vllm
     vllm_base_url: str = "http://localhost:8000/v1"
     vllm_model: str = "mistralai/Mistral-7B-Instruct-v0.2"
     vllm_api_key: str = "EMPTY"
+    vllm_max_tokens: int = Field(2048, ge=64)       # max output tokens per request
+    vllm_gpu_memory_utilization: float = Field(0.90, ge=0.1, le=1.0)
+    vllm_enable_speculative: bool = False
+    vllm_draft_model: str = ""          # HF model path for speculative draft
 
     # ── SGLang ──────────────────────────────────────────────────────────────
     # SGLang exposes an Ollama-compatible API (/api/chat, /api/generate).

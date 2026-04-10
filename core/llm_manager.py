@@ -100,14 +100,19 @@ def require_backend(raise_on_fail: bool = True) -> bool:
             f"    bash start.sh sglang   (managed mode)\n"
             f"  or manually:\n"
             f"    python -m sglang.launch_server \\\n"
-            f"        --model-path {settings.sglang_model}B \\\n"
+            f"        --model-path {settings.sglang_model} \\\n"
             f"        --port {settings.sglang_base_url.split(':')[-1].split('/')[0]} \\\n"
             f"        --host 0.0.0.0 --trust-remote-code\n"
         )
     elif backend == "ollama":
         error_msg += "  Start Ollama with:  ollama serve\n"
     elif backend == "vllm":
-        error_msg += "  Start vLLM with:  bash scripts/start_vllm.sh\n"
+        error_msg += (
+            f"  Start vLLM (managed stack):\n"
+            f"    bash start.sh vllm\n"
+            f"  Or start vLLM standalone:\n"
+            f"    bash scripts/start_vllm.sh\n"
+        )
     error_msg += f"{'='*60}\n"
 
     if raise_on_fail:
@@ -137,21 +142,47 @@ def _build_ollama_llm() -> BaseChatModel:
 
 def _build_vllm_llm() -> BaseChatModel:
     """
-    Instantiate the vLLM-backed chat model.
-    vLLM exposes an OpenAI-compatible REST API; we use langchain-openai with a
-    custom base_url pointing at the vLLM server.
+    Instantiate the vLLM-backed chat model via the OpenAI-compatible API.
+
+    vLLM (https://github.com/vllm-project/vllm) runs a high-performance
+    inference server with:
+      • PagedAttention  — efficient KV-cache memory management (higher throughput)
+      • Continuous batching — requests processed without waiting for a full batch
+      • OpenAI-compatible API — /v1/chat/completions, /v1/models, /v1/embeddings
+      • Tensor parallelism — multi-GPU inference support
+      • Quantisation — AWQ, GPTQ, FP8 for reduced VRAM usage
+
+    Configuration (.env):
+        LLM_BACKEND=vllm
+        VLLM_BASE_URL=http://localhost:8000/v1
+        VLLM_MODEL=mistralai/Mistral-7B-Instruct-v0.2
+        VLLM_API_KEY=EMPTY
+        VLLM_MAX_TOKENS=2048
+
+    Start the server:
+        bash scripts/start_vllm.sh
+        bash start.sh vllm              # managed stack (server + app together)
     """
     try:
         from langchain_openai import ChatOpenAI
     except ImportError as exc:
-        raise ImportError("langchain-openai is not installed. Run: pip install langchain-openai") from exc
-    logger.info("LLM backend -> vLLM | model=%s | url=%s", settings.vllm_model, settings.vllm_base_url)
+        raise ImportError(
+            "langchain-openai is not installed. Run: pip install langchain-openai"
+        ) from exc
+
+    logger.info(
+        "LLM backend -> vLLM (OpenAI-compat API) | model=%s | url=%s",
+        settings.vllm_model, settings.vllm_base_url,
+    )
+
+    max_tokens = getattr(settings, "vllm_max_tokens", 2048)
+
     return ChatOpenAI(
         base_url=settings.vllm_base_url,
         api_key=settings.vllm_api_key,
         model=settings.vllm_model,
         temperature=0.1,
-        max_tokens=2048,
+        max_tokens=max_tokens,
     )
 
 
@@ -262,7 +293,12 @@ def get_backend_info() -> dict:
     if backend == "ollama":
         info.update({"url": settings.ollama_base_url, "model": settings.ollama_model, "api": "ollama"})
     elif backend == "vllm":
-        info.update({"url": settings.vllm_base_url, "model": settings.vllm_model, "api": "openai-compatible"})
+        info.update({
+            "url":   settings.vllm_base_url,
+            "model": settings.vllm_model,
+            "api":   "openai-compatible",
+            "speculative": getattr(settings, "vllm_enable_speculative", False),
+        })
     elif backend == "sglang":
         info.update({
             "url":         settings.sglang_base_url,

@@ -58,6 +58,13 @@ playwright>=1.44.0              # Headless Chromium for JS-rendered pages
 
 
 # ─── Inference backends ───────────────────────────────────────────────────────
+# vLLM — GPU inference server (OpenAI-compatible API, PagedAttention).
+# Install: pip install vllm     (CUDA 12+, PyTorch required)
+# Managed: bash start.sh vllm   (starts server + app)
+# When LLM_BACKEND=vllm there is NO automatic fallback to Ollama.
+# Uncomment on GPU servers:
+# vllm>=0.4.2
+
 # SGLang — high-performance inference (RadixAttention, chunked prefill,
 #           speculative decoding). Requires CUDA 12+ GPU and PyTorch.
 #

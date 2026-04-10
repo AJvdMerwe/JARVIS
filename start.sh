@@ -82,7 +82,7 @@ while [[ $# -gt 0 ]]; do
       echo "  bash start.sh --ingest ./reports/ --mode chat"
       echo "  bash start.sh --backend vllm voice"
       exit 0 ;;
-    chat|voice|api|web|sglang|benchmark|docker|test)
+    chat|voice|api|web|sglang|vllm|benchmark|docker|test)
                   MODE="$1";        shift   ;;
     *)
       echo -e "${RED}Unknown argument: $1${RESET}"
@@ -97,7 +97,7 @@ done
 print_banner() {
   echo -e "${CYAN}${BOLD}"
   echo "  ╔══════════════════════════════════════════════════════════╗"
-  echo "  ║         Virtual Personal Assistant  v1.0                 ║"
+  echo "  ║         Virtual Personal Assistant  v1.0                ║"
   echo "  ║  Chat · Code · News · Search · Docs · Finance · Research ║"
   echo "  ╚══════════════════════════════════════════════════════════╝"
   echo -e "${RESET}"
@@ -421,6 +421,258 @@ launch_web() {
 }
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  vLLM helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+_vllm_port() {
+  local url="${VLLM_BASE_URL:-http://localhost:8000/v1}"
+  python3 -c "
+import sys
+u = sys.argv[1]
+try:
+    from urllib.parse import urlparse
+    p = urlparse(u).port
+    print(p if p else 8000)
+except Exception:
+    print(8000)
+" "${url}"
+}
+
+_vllm_model() {
+  echo "${VLLM_MODEL:-mistralai/Mistral-7B-Instruct-v0.2}"
+}
+
+_vllm_ready() {
+  # vLLM uses OpenAI-compat /v1/models (not /api/tags)
+  local url="${1:-${VLLM_BASE_URL:-http://localhost:8000/v1}}"
+  curl -sf "${url%/}/models" &>/dev/null
+}
+
+_vllm_wait_ready() {
+  local url="${1:-${VLLM_BASE_URL:-http://localhost:8000/v1}}"
+  local timeout="${2:-180}"
+  local waited=0
+  until _vllm_ready "${url}"; do
+    sleep 2; (( waited += 2 ))
+    (( waited >= timeout )) && return 1
+    (( waited % 10 == 0 )) && echo -e "  ${DIM}Still waiting for vLLM… ${waited}s / ${timeout}s${RESET}"
+  done
+  return 0
+}
+
+launch_vllm() {
+  # ════════════════════════════════════════════════════════════════════════════
+  # MODE: bash start.sh vllm [--app-mode web|api|chat|voice]
+  #
+  # Managed vLLM stack:
+  #   1. Starts the vLLM OpenAI-compatible server in the background
+  #   2. Streams server logs to data/logs/vllm.log
+  #   3. Waits until /v1/models responds (up to 3 min)
+  #   4. Sets LLM_BACKEND=vllm — no Ollama fallback
+  #   5. Launches the application layer
+  #   6. Shuts down vLLM gracefully on exit
+  #
+  # --app-mode  web    (default)  http://localhost:${API_PORT}/ui/
+  # --app-mode  api              REST + WebSocket + SSE
+  # --app-mode  chat             interactive REPL
+  # --app-mode  voice            voice REPL
+  # ════════════════════════════════════════════════════════════════════════════
+
+  echo ""
+  echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════════════╗${RESET}"
+  echo -e "${BOLD}${CYAN}║            Jarvis  ×  vLLM  Managed Stack               ║${RESET}"
+  echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════════════════╝${RESET}"
+  echo ""
+
+  # ── Pre-flight: vllm installed? ───────────────────────────────────────────
+  if ! python3 -c "import vllm" 2>/dev/null; then
+    echo -e "${RED}${BOLD}ERROR: vLLM is not installed.${RESET}"
+    echo ""
+    echo -e "  Install with:  ${BOLD}pip install vllm${RESET}"
+    echo -e "  Requirements:  CUDA 12+  |  GPU ≥ 8 GB VRAM (fp16)"
+    echo ""
+    exit 1
+  fi
+
+  if ! python3 -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
+    echo -e "${RED}${BOLD}ERROR: CUDA not available — vLLM requires a CUDA GPU.${RESET}"
+    echo -e "  ${DIM}For CPU-only use: bash start.sh   (defaults to Ollama)${RESET}"
+    echo ""
+    exit 1
+  fi
+
+  local vllm_port vllm_model vllm_url vllm_logfile
+  vllm_port="$(_vllm_port)"
+  vllm_model="$(_vllm_model)"
+  vllm_url="${VLLM_BASE_URL:-http://localhost:${vllm_port}/v1}"
+  vllm_logfile="${SCRIPT_DIR}/data/logs/vllm.log"
+  mkdir -p "$(dirname "${vllm_logfile}")"
+
+  local gpu_util="${VLLM_GPU_MEMORY_UTILIZATION:-0.90}"
+  local max_len="${VLLM_MAX_MODEL_LEN:-4096}"
+  local quant="${VLLM_QUANTIZATION:-}"
+  local tp="${VLLM_TENSOR_PARALLEL:-1}"
+  local spec="${VLLM_ENABLE_SPECULATIVE:-false}"
+  local draft="${VLLM_DRAFT_MODEL:-}"
+
+  echo -e "  ${BOLD}Inference server${RESET}"
+  echo -e "  ${DIM}Model      : ${vllm_model}"
+  echo -e "  Port       : ${vllm_port}  (OpenAI-compatible API)"
+  echo -e "  API URL    : ${vllm_url}"
+  echo -e "  GPU util   : ${gpu_util}  |  Max ctx: ${max_len}"
+  [[ -n "${quant}"         ]] && echo -e "  Quantised  : ${quant}"
+  [[ "${tp}" -gt 1         ]] && echo -e "  Tensor //  : ${tp} GPUs"
+  [[ "$spec" == "true"     ]] && echo -e "  Speculative: ${draft:-<no draft model set>}"
+  echo -e "  Log file   : ${vllm_logfile}${RESET}"
+  echo ""
+  echo -e "  ${BOLD}Application${RESET}"
+  echo -e "  ${DIM}App mode : ${APP_MODE}"
+  [[ "${APP_MODE}" == "web" || "${APP_MODE}" == "api" ]] && \
+    echo -e "  URL      : http://localhost:${API_PORT}$([ "${APP_MODE}" = "web" ] && echo "/ui/" || echo "/chat")"
+  echo -e "${RESET}"
+
+  # ── Check if vLLM already running ─────────────────────────────────────────
+  local VLLM_PID=""
+  if _vllm_ready "${vllm_url}"; then
+    ok "vLLM server already running at ${vllm_url}"
+  else
+    log "Starting vLLM server (model load may take 30–120 s)…"
+    echo -e "${DIM}  Streaming server log: tail -f ${vllm_logfile}${RESET}"
+    echo ""
+
+    # Build command
+    local cmd=(
+      python3 -m vllm.entrypoints.openai.api_server
+      --model                  "${vllm_model}"
+      --host                   "0.0.0.0"
+      --port                   "${vllm_port}"
+      --gpu-memory-utilization "${gpu_util}"
+      --max-model-len          "${max_len}"
+      --tensor-parallel-size   "${tp}"
+      --trust-remote-code
+    )
+    [[ -n "$quant"       ]] && cmd+=(--quantization "${quant}")
+    [[ "$spec" == "true" && -n "$draft" ]] && cmd+=(
+      --speculative-model "${draft}"
+      --num-speculative-tokens "${VLLM_NUM_SPECULATIVE_TOKENS:-5}"
+    )
+
+    # Launch in background
+    "${cmd[@]}" >> "${vllm_logfile}" 2>&1 &
+    VLLM_PID=$!
+    echo -e "${DIM}  vLLM PID: ${VLLM_PID}${RESET}"
+
+    # Graceful shutdown trap
+    # shellcheck disable=SC2064
+    trap "
+      echo ''
+      echo -e '  ${DIM}Shutting down vLLM server (PID ${VLLM_PID})…${RESET}'
+      kill '${VLLM_PID}' 2>/dev/null || true
+      wait '${VLLM_PID}' 2>/dev/null || true
+      echo -e '  ${DIM}vLLM stopped.${RESET}'
+    " EXIT INT TERM
+
+    if ! _vllm_wait_ready "${vllm_url}" 180; then
+      echo ""
+      echo -e "${RED}${BOLD}ERROR: vLLM server did not become ready within 180 s.${RESET}"
+      echo ""
+      echo -e "  Check the log:  ${DIM}tail -80 ${vllm_logfile}${RESET}"
+      echo ""
+      echo -e "  Common causes:"
+      echo -e "    • Model not cached — first run downloads from HuggingFace"
+      echo -e "      Run: ${BOLD}huggingface-cli download ${vllm_model}${RESET}"
+      echo -e "    • Insufficient VRAM — try quantisation:"
+      echo -e "      ${BOLD}VLLM_QUANTIZATION=awq${RESET} in .env  (halves VRAM usage)"
+      echo -e "    • Port ${vllm_port} in use — change VLLM_BASE_URL in .env"
+      echo ""
+      exit 1
+    fi
+
+    ok "vLLM server ready at ${vllm_url}  (PID ${VLLM_PID})"
+  fi
+
+  # ── Lock backend ──────────────────────────────────────────────────────────
+  export LLM_BACKEND=vllm
+  export VLLM_BASE_URL="${vllm_url}"
+  info "LLM_BACKEND locked to vllm — Ollama will not be used"
+
+  echo ""
+  echo -e "${DIM}────────────────────────────────────────────────────────${RESET}"
+  echo ""
+
+  # ── Launch the application ────────────────────────────────────────────────
+  case "${APP_MODE}" in
+    web)
+      echo -e "${BOLD}${CYAN}Web interface →  http://localhost:${API_PORT}/ui/${RESET}"
+      echo ""
+      uvicorn api.server:app \
+        --host 0.0.0.0 \
+        --port "${API_PORT}" \
+        --reload \
+        --log-level info
+      ;;
+    api)
+      echo -e "${BOLD}${CYAN}API server  →  http://localhost:${API_PORT}/chat${RESET}"
+      echo -e "${DIM}  Docs: http://localhost:${API_PORT}/docs${RESET}"
+      echo ""
+      uvicorn api.server:app \
+        --host 0.0.0.0 \
+        --port "${API_PORT}" \
+        --reload \
+        --log-level info
+      ;;
+    chat)
+      echo -e "${BOLD}${CYAN}Interactive REPL${RESET}"
+      echo -e "${DIM}  Type :help for commands${RESET}"
+      echo ""
+      python3 cli.py chat
+      ;;
+    voice)
+      echo -e "${BOLD}${CYAN}Voice REPL${RESET}"
+      echo -e "${DIM}  Whisper STT + pyttsx3 TTS active${RESET}"
+      echo ""
+      python3 cli.py chat --voice
+      ;;
+    *)
+      fail "Unknown --app-mode '${APP_MODE}'. Valid: web | api | chat | voice"
+      ;;
+  esac
+}
+
+ensure_vllm() {
+  # Called in main() AFTER setup_env so .env is loaded.
+  # Probes /v1/models when LLM_BACKEND=vllm and MODE is not vllm.
+  local backend="${LLM_BACKEND:-ollama}"
+  [[ "$backend" != "vllm" ]] && return 0
+  [[ "$MODE"    == "vllm" ]] && return 0   # managed stack handles this itself
+
+  local vllm_url="${VLLM_BASE_URL:-http://localhost:8000/v1}"
+
+  echo -e "${DIM}  Probing vLLM server at ${vllm_url}…${RESET}"
+
+  if _vllm_ready "${vllm_url}"; then
+    ok "vLLM server ready at ${vllm_url}"
+    return 0
+  fi
+
+  echo ""
+  echo -e "${RED}${BOLD}ERROR: LLM_BACKEND=vllm but no server at ${vllm_url}${RESET}"
+  echo ""
+  echo -e "  Use the managed stack (starts server + app together):"
+  echo -e "    ${BOLD}bash start.sh vllm${RESET}                    # + web UI (default)"
+  echo -e "    ${BOLD}bash start.sh vllm --app-mode api${RESET}     # + REST API"
+  echo -e "    ${BOLD}bash start.sh vllm --app-mode chat${RESET}    # + REPL"
+  echo ""
+  echo -e "  Or start vLLM standalone then re-run:"
+  echo -e "    ${BOLD}bash scripts/start_vllm.sh${RESET}"
+  echo ""
+  echo -e "  ${BOLD}Jarvis will not fall back to Ollama when LLM_BACKEND=vllm.${RESET}"
+  echo ""
+  exit 1
+}
+
 launch_benchmark() {
   echo ""
   echo -e "${BOLD}${CYAN}Running inference benchmark…${RESET}"
@@ -433,89 +685,252 @@ launch_benchmark() {
     --warmup "${BENCHMARK_WARMUP:-1}"
 }
 
-launch_sglang() {
-  # ── Mode: "bash start.sh sglang" — launches the SGLang server only ───────
-  echo ""
-  echo -e "${BOLD}${CYAN}Starting SGLang inference server…${RESET}"
-  if ! python -c "import sglang" 2>/dev/null; then
-    echo ""
-    echo -e "${RED}ERROR: sglang is not installed.${RESET}"
-    echo -e "  Run: ${BOLD}pip install sglang[all]${RESET}"
-    echo -e "  (Requires CUDA 12+ and PyTorch)"
-    exit 1
-  fi
-  # Derive port from SGLANG_BASE_URL (e.g. http://localhost:11435 → 11435)
-  local sglang_port
-  sglang_port=$(python -c "
-import os; u = os.environ.get('SGLANG_BASE_URL','http://localhost:11435')
+# ─────────────────────────────────────────────────────────────────────────────
+#  SGLang helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+_sglang_port() {
+  local url="${SGLANG_BASE_URL:-http://localhost:11435}"
+  python3 -c "
+import sys
+u = sys.argv[1]
 try:
-    from urllib.parse import urlparse; print(urlparse(u).port or 11435)
-except Exception: print(11435)
-")
-  local sglang_model="${SGLANG_MODEL:Qwen/Qwen3-0.6B}"
-
-  echo -e "${DIM}  Model  : ${sglang_model}"
-  echo -e "  Port   : ${sglang_port}"
-  echo -e "  URL    : http://localhost:${sglang_port}  (Ollama-compat API)${RESET}"
-  echo ""
-
-  # Build arg list
-  local sglang_args=(
-    --model-path   "${sglang_model}"
-    --host         "0.0.0.0"
-    --port         "${sglang_port}"
-    --trust-remote-code
-  )
-  [[ -n "${SGLANG_MEM_FRACTION:-}"        ]] && sglang_args+=(--mem-fraction-static "${SGLANG_MEM_FRACTION}")
-  [[ -n "${SGLANG_MAX_PREFILL_TOKENS:-}"  ]] && sglang_args+=(--max-prefill-tokens  "${SGLANG_MAX_PREFILL_TOKENS}")
-  [[ "${SGLANG_ENABLE_SPECULATIVE:-false}" == "true" ]] && {
-    sglang_args+=(--speculative-algo EAGLE)
-    [[ -n "${SGLANG_DRAFT_MODEL:-}" ]] && sglang_args+=(--speculative-draft-model-path "${SGLANG_DRAFT_MODEL}")
-  }
-
-  exec python -m sglang.launch_server "${sglang_args[@]}"
+    from urllib.parse import urlparse
+    p = urlparse(u).port
+    print(p if p else 11435)
+except Exception:
+    print(11435)
+" "${url}"
 }
 
-ensure_sglang() {
-  # ── Called before launching the app when LLM_BACKEND=sglang ──────────────
-  # Derives the URL from the environment and probes /api/tags.
-  # Fails hard if SGLang is not reachable — never falls back to Ollama.
-  local backend="${LLM_BACKEND:-$(grep -m1 '^LLM_BACKEND=' "${SCRIPT_DIR}/.env" 2>/dev/null | cut -d= -f2 | tr -d ' "' || echo 'ollama')}"
-  [[ "$backend" != "sglang" ]] && return 0
+_sglang_model() {
+  echo "${SGLANG_MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
+}
 
-  local sglang_url
-  sglang_url="${SGLANG_BASE_URL:-$(grep -m1 '^SGLANG_BASE_URL=' "${SCRIPT_DIR}/.env" 2>/dev/null | cut -d= -f2 | tr -d ' "' || echo 'http://localhost:11435')}"
+_sglang_ready() {
+  # Returns 0 when /api/tags responds, 1 otherwise
+  local url="${1:-${SGLANG_BASE_URL:-http://localhost:11435}}"
+  curl -sf "${url%/}/api/tags" &>/dev/null
+}
 
-  local probe_url="${sglang_url%/}/api/tags"
-
-  echo -e "${DIM}  Checking SGLang server at ${sglang_url}…${RESET}"
-
+_sglang_wait_ready() {
+  # Poll until SGLang responds or timeout is reached
+  # $1=url  $2=timeout_sec (default 180)
+  local url="${1:-${SGLANG_BASE_URL:-http://localhost:11435}}"
+  local timeout="${2:-180}"
   local waited=0
-  local max_wait=10   # seconds — SGLang should already be running
-  until curl -sf "${probe_url}" &>/dev/null; do
-    sleep 1; (( waited++ ))
-    if (( waited >= max_wait )); then
+  until _sglang_ready "${url}"; do
+    sleep 2; (( waited += 2 ))
+    (( waited >= timeout )) && return 1
+    (( waited % 10 == 0 )) && echo -e "  ${DIM}Still waiting for SGLang… ${waited}s / ${timeout}s${RESET}"
+  done
+  return 0
+}
+
+_sglang_build_args() {
+  # Emit SGLang launch_server arguments based on environment variables
+  local sglang_port sglang_model
+  sglang_port="$(_sglang_port)"
+  sglang_model="$(_sglang_model)"
+  local args=(
+    --model-path    "${sglang_model}"
+    --host          "0.0.0.0"
+    --port          "${sglang_port}"
+    --trust-remote-code
+  )
+  [[ -n "${SGLANG_MEM_FRACTION:-}"       ]] && args+=(--mem-fraction-static "${SGLANG_MEM_FRACTION}")
+  [[ -n "${SGLANG_MAX_PREFILL_TOKENS:-}" ]] && args+=(--max-prefill-tokens  "${SGLANG_MAX_PREFILL_TOKENS}")
+  [[ "${SGLANG_ENABLE_SPECULATIVE:-false}" == "true" ]] && {
+    args+=(--speculative-algo EAGLE)
+    [[ -n "${SGLANG_DRAFT_MODEL:-}" ]] && args+=(--speculative-draft-model-path "${SGLANG_DRAFT_MODEL}")
+  }
+  printf '%s\n' "${args[@]}"
+}
+
+launch_sglang() {
+  # ════════════════════════════════════════════════════════════════════════════
+  # MODE: bash start.sh sglang [--app-mode web|api|chat|voice]
+  #
+  # Managed SGLang stack — runs everything in one command:
+  #   1. Starts the SGLang inference server in the background
+  #   2. Streams server logs to data/logs/sglang.log
+  #   3. Waits until the server is ready (polls /api/tags, up to 3 min)
+  #   4. Sets LLM_BACKEND=sglang for the current process — no Ollama fallback
+  #   5. Launches the application layer (default: web UI)
+  #   6. Shuts down the SGLang server gracefully when the app exits
+  #
+  # Options:
+  #   --app-mode web    (default) open http://localhost:${API_PORT}/ui/
+  #   --app-mode api    REST + WebSocket + SSE on port ${API_PORT}
+  #   --app-mode chat   interactive REPL
+  #   --app-mode voice  voice REPL (requires VOICE_ENABLED=true)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  echo ""
+  echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════════════╗${RESET}"
+  echo -e "${BOLD}${CYAN}║           Jarvis  ×  SGLang  Managed Stack              ║${RESET}"
+  echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════════════════╝${RESET}"
+  echo ""
+
+  # ── Pre-flight: sglang installed? ─────────────────────────────────────────
+  if ! python3 -c "import sglang" 2>/dev/null; then
+    echo -e "${RED}${BOLD}ERROR: sglang is not installed.${RESET}"
+    echo ""
+    echo -e "  Install it with:"
+    echo -e "    ${BOLD}pip install sglang[all]${RESET}"
+    echo ""
+    echo -e "  Requirements:"
+    echo -e "    • CUDA 12+  (GPU with ≥ 8 GB VRAM for 8B models)"
+    echo -e "    • PyTorch with CUDA"
+    echo ""
+    exit 1
+  fi
+
+  local sglang_port sglang_model sglang_url sglang_logfile
+  sglang_port="$(_sglang_port)"
+  sglang_model="$(_sglang_model)"
+  sglang_url="${SGLANG_BASE_URL:-http://localhost:${sglang_port}}"
+  sglang_logfile="${SCRIPT_DIR}/data/logs/sglang.log"
+  mkdir -p "$(dirname "${sglang_logfile}")"
+
+  echo -e "  ${BOLD}Inference server${RESET}"
+  echo -e "  ${DIM}Model    : ${sglang_model}"
+  echo -e "  Port     : ${sglang_port}  (Ollama-compatible API)"
+  echo -e "  API URL  : ${sglang_url}"
+  echo -e "  Log file : ${sglang_logfile}${RESET}"
+  echo ""
+  echo -e "  ${BOLD}Application${RESET}"
+  echo -e "  ${DIM}App mode : ${APP_MODE}"
+  [[ "${APP_MODE}" == "web" || "${APP_MODE}" == "api" ]] && \
+    echo -e "  URL      : http://localhost:${API_PORT}$([ "${APP_MODE}" = "web" ] && echo "/ui/" || echo "/chat")"
+  echo -e "${RESET}"
+
+  # ── Check if SGLang is already running (skip start if so) ─────────────────
+  local SGLANG_PID=""
+  if _sglang_ready "${sglang_url}"; then
+    ok "SGLang server already running at ${sglang_url}"
+  else
+    log "Starting SGLang server (model load may take 30–120 s)…"
+    echo -e "${DIM}  Streaming server log: tail -f ${sglang_logfile}${RESET}"
+    echo ""
+
+    # Read args into array (one per line from helper)
+    mapfile -t sglang_args < <(_sglang_build_args)
+
+    # Launch in background, log to file
+    python3 -m sglang.launch_server "${sglang_args[@]}" \
+      >> "${sglang_logfile}" 2>&1 &
+    SGLANG_PID=$!
+
+    echo -e "${DIM}  SGLang PID: ${SGLANG_PID}${RESET}"
+
+    # Graceful shutdown when the app exits (any signal)
+    # shellcheck disable=SC2064
+    trap "
+      echo ''
+      echo -e '  ${DIM}Shutting down SGLang server (PID ${SGLANG_PID})…${RESET}'
+      kill '${SGLANG_PID}' 2>/dev/null || true
+      wait '${SGLANG_PID}' 2>/dev/null || true
+      echo -e '  ${DIM}SGLang stopped.${RESET}'
+    " EXIT INT TERM
+
+    # Wait for server to be ready
+    if ! _sglang_wait_ready "${sglang_url}" 180; then
       echo ""
-      echo -e "${RED}${BOLD}ERROR: SGLang server not reachable at ${sglang_url}${RESET}"
+      echo -e "${RED}${BOLD}ERROR: SGLang server did not become ready within 180 s.${RESET}"
       echo ""
-      echo -e "  LLM_BACKEND=sglang is set but the SGLang server is not running."
-      echo -e "  Start it in a separate terminal first:"
+      echo -e "  Check the log:"
+      echo -e "    ${DIM}tail -80 ${sglang_logfile}${RESET}"
       echo ""
-      echo -e "    ${BOLD}bash start.sh sglang${RESET}"
-      echo ""
-      echo -e "  Or start it manually:"
-      echo -e "    ${DIM}python -m sglang.launch_server \\"
-      echo -e "        --model-path \${SGLANG_MODEL:-meta-llama/Llama-3.1-8B-Instruct} \\"
-      echo -e "        --port 11435 --host 0.0.0.0 --trust-remote-code${RESET}"
-      echo ""
-      echo -e "  ${BOLD}Jarvis will NOT fall back to Ollama when --backend sglang is set.${RESET}"
+      echo -e "  Common causes:"
+      echo -e "    • Model not cached — first run downloads from HuggingFace (may be slow)"
+      echo -e "      Run:  ${BOLD}huggingface-cli download ${sglang_model}${RESET}"
+      echo -e "    • Insufficient GPU VRAM — try a smaller model or set:"
+      echo -e "      ${BOLD}SGLANG_MEM_FRACTION=0.75${RESET}  in .env"
+      echo -e "    • Port ${sglang_port} already in use — change SGLANG_BASE_URL in .env"
       echo ""
       exit 1
     fi
-    echo -e "  ${DIM}Waiting for SGLang… (${waited}s)${RESET}"
-  done
 
-  ok "SGLang server ready at ${sglang_url}"
+    ok "SGLang server ready at ${sglang_url}  (PID ${SGLANG_PID})"
+  fi
+
+  # ── Lock in the backend — no Ollama fallback ───────────────────────────────
+  export LLM_BACKEND=sglang
+  export SGLANG_BASE_URL="${sglang_url}"
+  info "LLM_BACKEND locked to sglang — Ollama will not be used"
+
+  echo ""
+  echo -e "${DIM}────────────────────────────────────────────────────────${RESET}"
+  echo ""
+
+  # ── Launch the application ─────────────────────────────────────────────────
+  case "${APP_MODE}" in
+    web)
+      echo -e "${BOLD}${CYAN}Web interface →  http://localhost:${API_PORT}/ui/${RESET}"
+      echo ""
+      uvicorn api.server:app \
+        --host 0.0.0.0 \
+        --port "${API_PORT}" \
+        --reload \
+        --log-level info
+      ;;
+    api)
+      echo -e "${BOLD}${CYAN}API server  →  http://localhost:${API_PORT}/chat${RESET}"
+      echo -e "${DIM}  Docs: http://localhost:${API_PORT}/docs${RESET}"
+      echo ""
+      uvicorn api.server:app \
+        --host 0.0.0.0 \
+        --port "${API_PORT}" \
+        --reload \
+        --log-level info
+      ;;
+    chat)
+      echo -e "${BOLD}${CYAN}Interactive REPL${RESET}"
+      echo -e "${DIM}  Type :help for commands${RESET}"
+      echo ""
+      python3 cli.py chat
+      ;;
+    voice)
+      echo -e "${BOLD}${CYAN}Voice REPL${RESET}"
+      echo -e "${DIM}  Whisper STT + pyttsx3 TTS active${RESET}"
+      echo ""
+      python3 cli.py chat --voice
+      ;;
+    *)
+      fail "Unknown --app-mode '${APP_MODE}'. Valid: web | api | chat | voice"
+      ;;
+  esac
+}
+
+ensure_sglang() {
+  # Called in main() AFTER setup_env so .env variables are loaded.
+  # Only active when LLM_BACKEND=sglang and MODE != sglang
+  # (sglang mode starts its own server — no external probe needed).
+  local backend="${LLM_BACKEND:-ollama}"
+  [[ "$backend" != "sglang" ]]  && return 0
+  [[ "$MODE"    == "sglang"  ]] && return 0   # managed stack handles this itself
+
+  local sglang_url="${SGLANG_BASE_URL:-http://localhost:11435}"
+
+  echo -e "${DIM}  Probing SGLang server at ${sglang_url}…${RESET}"
+
+  if _sglang_ready "${sglang_url}"; then
+    ok "SGLang server ready at ${sglang_url}"
+    return 0
+  fi
+
+  echo ""
+  echo -e "${RED}${BOLD}ERROR: LLM_BACKEND=sglang but no server at ${sglang_url}${RESET}"
+  echo ""
+  echo -e "  Use the managed stack (starts server + app together):"
+  echo -e "    ${BOLD}bash start.sh sglang${RESET}                    # + web UI (default)"
+  echo -e "    ${BOLD}bash start.sh sglang --app-mode api${RESET}     # + REST API"
+  echo -e "    ${BOLD}bash start.sh sglang --app-mode chat${RESET}    # + REPL"
+  echo ""
+  echo -e "  ${BOLD}Jarvis will not fall back to Ollama when LLM_BACKEND=sglang.${RESET}"
+  echo ""
+  exit 1
 }
 
 launch_benchmark() {
@@ -648,6 +1063,7 @@ main() {
   # ── Setup steps (always run, fast if already done) ──────────────────────
   check_python
   ensure_sglang
+  ensure_vllm
 
   # Docker mode skips Python setup entirely
   if [[ "$MODE" == "docker" ]]; then
@@ -684,13 +1100,15 @@ main() {
 
   # ── Long-running modes ───────────────────────────────────────────────────
   case "$MODE" in
-    chat)   launch_chat   ;;
-    voice)  launch_voice  ;;
-    api)    launch_api    ;;
+    chat)      launch_chat      ;;
+    voice)     launch_voice     ;;
+    api)       launch_api       ;;
     web)       launch_web       ;;
+    sglang)    launch_sglang    ;;
+    vllm)      launch_vllm      ;;
     benchmark) export LLM_BACKEND_SKIP_PROBE=true; launch_benchmark ;;
     test)      export LLM_BACKEND_SKIP_PROBE=true; launch_test      ;;
-    *)      fail "Unknown mode: ${MODE}" ;;
+    *)         fail "Unknown mode: ${MODE}" ;;
   esac
 }
 

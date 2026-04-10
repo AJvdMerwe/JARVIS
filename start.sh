@@ -534,8 +534,8 @@ launch_vllm() {
   echo -e "${RESET}"
 
   # ── Check if vLLM already running ─────────────────────────────────────────
-  local VLLM_PID=""
-  if _vllm_ready "${vllm_url}"; then
+  # Check if vLLM Docker container is already running
+  if docker ps -q --filter "name=^/jarvis-vllm$" 2>/dev/null | grep -q . || _vllm_ready "${vllm_url}"; then
     ok "vLLM server already running at ${vllm_url}"
   else
     log "Starting vLLM server (model load may take 30–120 s)…"
@@ -559,38 +559,48 @@ launch_vllm() {
       --num-speculative-tokens "${VLLM_NUM_SPECULATIVE_TOKENS:-5}"
     )
 
-    # Launch in background
-    "${cmd[@]}" >> "${vllm_logfile}" 2>&1 &
-    VLLM_PID=$!
-    echo -e "${DIM}  vLLM PID: ${VLLM_PID}${RESET}"
+    # Delegate to the Docker-based launcher (detached mode)
+    local vllm_script="${SCRIPT_DIR}/scripts/start_vllm.sh"
+    if [[ ! -f "$vllm_script" ]]; then
+      fail "scripts/start_vllm.sh not found. Run from the project root."
+    fi
 
-    # Graceful shutdown trap
-    # shellcheck disable=SC2064
+    log "Launching vLLM Docker container via scripts/start_vllm.sh…"
+    bash "${vllm_script}" \
+      --model        "${vllm_model}" \
+      --port         "${vllm_port}" \
+      --gpu-util     "${gpu_util}" \
+      --max-model-len "${max_len}" \
+      --detach \
+      2>&1 | tee -a "${vllm_logfile}" | sed "s/^/  /" || {
+      fail "Failed to start vLLM Docker container. Check logs above."
+    }
+
+    # Graceful shutdown trap — stop the Docker container on exit
+    local container_name="jarvis-vllm"
     trap "
       echo ''
-      echo -e '  ${DIM}Shutting down vLLM server (PID ${VLLM_PID})…${RESET}'
-      kill '${VLLM_PID}' 2>/dev/null || true
-      wait '${VLLM_PID}' 2>/dev/null || true
-      echo -e '  ${DIM}vLLM stopped.${RESET}'
+      echo -e '  ${DIM}Stopping vLLM container…${RESET}'
+      docker stop '${container_name}' 2>/dev/null || true
+      echo -e '  ${DIM}vLLM container stopped.${RESET}'
     " EXIT INT TERM
 
     if ! _vllm_wait_ready "${vllm_url}" 180; then
       echo ""
-      echo -e "${RED}${BOLD}ERROR: vLLM server did not become ready within 180 s.${RESET}"
+      echo -e "${RED}${BOLD}ERROR: vLLM Docker container did not become ready within 180 s.${RESET}"
       echo ""
-      echo -e "  Check the log:  ${DIM}tail -80 ${vllm_logfile}${RESET}"
+      echo -e "  Check container logs:  ${DIM}docker logs jarvis-vllm${RESET}"
       echo ""
       echo -e "  Common causes:"
       echo -e "    • Model not cached — first run downloads from HuggingFace"
-      echo -e "      Run: ${BOLD}huggingface-cli download ${vllm_model}${RESET}"
-      echo -e "    • Insufficient VRAM — try quantisation:"
-      echo -e "      ${BOLD}VLLM_QUANTIZATION=awq${RESET} in .env  (halves VRAM usage)"
+      echo -e "    • Insufficient VRAM — set VLLM_QUANTIZATION=awq in .env"
+      echo -e "    • NGC image pull failed (Blackwell) — login: docker login nvcr.io"
       echo -e "    • Port ${vllm_port} in use — change VLLM_BASE_URL in .env"
       echo ""
       exit 1
     fi
 
-    ok "vLLM server ready at ${vllm_url}  (PID ${VLLM_PID})"
+    ok "vLLM Docker container ready at ${vllm_url}"
   fi
 
   # ── Lock backend ──────────────────────────────────────────────────────────
@@ -665,8 +675,8 @@ ensure_vllm() {
   echo -e "    ${BOLD}bash start.sh vllm --app-mode api${RESET}     # + REST API"
   echo -e "    ${BOLD}bash start.sh vllm --app-mode chat${RESET}    # + REPL"
   echo ""
-  echo -e "  Or start vLLM standalone then re-run:"
-  echo -e "    ${BOLD}bash scripts/start_vllm.sh${RESET}"
+  echo -e "  Or start vLLM Docker standalone then re-run:"
+  echo -e "    ${BOLD}bash scripts/start_vllm.sh${RESET}  (uses Docker automatically)"
   echo ""
   echo -e "  ${BOLD}Jarvis will not fall back to Ollama when LLM_BACKEND=vllm.${RESET}"
   echo ""

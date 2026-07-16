@@ -5,7 +5,7 @@ LangGraph-based multi-agent orchestrator — the single entry point for all
 user interactions.
 
 Architecture:
-  ┌─────────────────────────────────────────────────────────────────────────┐
+  ┌─────────────────────────────────────────────────────────────────────┐
   │                           Orchestrator                                  │
   │                                                                         │
   │  User Input                                                             │
@@ -838,7 +838,7 @@ class Orchestrator:
             kwargs.setdefault("user_id", user_id)
 
 
-        # ── Schedule detection ────────────────────────────────────────────────
+        # ── Schedule detection ────────────────────────
         # If the query contains a scheduling intent, register a user task
         # and return a confirmation instead of running the normal agent.
         sched_response = self._maybe_schedule_task(query, intent, user_id or self._user_id)
@@ -876,7 +876,7 @@ class Orchestrator:
                         logger.debug("Summariser error: %s", exc)
                 return rag_response
 
-        # ── Primary attempt ───────────────────────────────────────────────────
+        # ── Primary attempt ──────────────────────
         primary_agent = self._agents.get(intent) or self._agents[Intent.CHAT]
         response      = self._call_agent(primary_agent, query, **kwargs)
         attempts: list[tuple[str, AgentResponse]] = [(primary_agent.name, response)]
@@ -888,7 +888,7 @@ class Orchestrator:
                 **kwargs,
             )
 
-        # ── Post-processing ───────────────────────────────────────────────────
+        # ── Post-processing ──────────────────────
         self._close_trace(trace_obj, response)
         self._memory.save_context(query, response.output)
 
@@ -1153,8 +1153,10 @@ class Orchestrator:
             else self._route(query)
         )
 
+        trace_obj = self._open_trace(query)
 
-        # ── Schedule detection ────────────────────────────────────────────────
+
+        # ── Schedule detection ────────────────────────
         # If the query contains a scheduling intent, register a user task
         # and return a confirmation instead of running the normal agent.
         sched_response = self._maybe_schedule_task(query, intent, user_id or self._user_id)
@@ -1192,7 +1194,7 @@ class Orchestrator:
             yield f"\n[Error: {exc}]"
             return
 
-        # ── Post-processing ───────────────────────────────────────────────────
+        # ── Post-processing ──────────────────────
         full_output = "".join(buffer)
         self._memory.save_context(query, full_output)
 

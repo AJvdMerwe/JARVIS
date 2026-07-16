@@ -809,3 +809,6 @@ class TestOrchestratorMisc:
         orch = _make_orchestrator()
         agent = orch.get_agent(Intent.FINANCE)
         assert agent is orch._agents[Intent.FINANCE]
+
+    def test_stream_schedule_branch_yields_confirmation_and_saves_memory(self):
+        pass

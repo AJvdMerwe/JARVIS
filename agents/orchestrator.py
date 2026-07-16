@@ -1163,7 +1163,8 @@ class Orchestrator:
         if sched_response is not None:
             self._close_trace(trace_obj, sched_response)
             self._memory.save_context(query, sched_response.output)
-            return sched_response
+        yield sched_response.output
+        return
 
         # ── RAG pre-check ─────────────────────────────────────────────────────
         if self._enable_rag_precheck:

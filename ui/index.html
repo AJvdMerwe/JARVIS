@@ -96,7 +96,7 @@ body::after{
   100%{background-position:0% 50%}
 }
 
-/* ─── LOGIN ────────────────────────────────────────────────────────── */
+/* ─── LOGIN ───────────────────────────────────────────────────── */
 #login-page{
   position:fixed;
   inset:0;
@@ -293,7 +293,7 @@ body::after{
 .pw-strength{height:4px;border-radius:999px;background:rgba(255,255,255,.1);margin-top:8px;overflow:hidden}
 .pw-strength-bar{height:100%;border-radius:999px;transition:width .3s,background .3s;width:0}
 
-/* ─── APP SHELL ─────────────────────────────────────────────────────────── */
+/* ─── APP SHELL ──────────────────────────────────────────────── */
 #app{
   display:none;
   flex-direction:column;
@@ -495,7 +495,7 @@ body::after{
   gap:12px;
 }
 
-/* ─── LEFT SIDEBAR ──────────────────────────────────────────────────────── */
+/* ─── LEFT SIDEBAR ─────────────────────────────────────────── */
 .sidebar-left{
   width:var(--sidebar-left);
   background:linear-gradient(180deg,rgba(15,20,34,.78),rgba(15,20,34,.55));
@@ -613,7 +613,7 @@ body::after{
 .history-item:hover .history-del{opacity:1}
 .history-del:hover{background:rgba(239,68,68,.18);color:#fecaca}
 
-/* ─── CHAT AREA ─────────────────────────────────────────────────────────── */
+/* ─── CHAT AREA ──────────────────────────────────────────── */
 .chat-area{flex:1;display:flex;flex-direction:column;overflow:hidden;background:var(--bg);min-width:0}
 .messages{flex:1;overflow-y:auto;padding:20px 0}
 .message-row{display:flex;padding:4px 20px;margin-bottom:4px;max-width:100%}
@@ -667,7 +667,7 @@ body::after{
 .tool-btn:hover{background:var(--bg3);color:var(--text2);border-color:var(--border)}
 .tool-btn.active{background:var(--accent-glow);color:var(--accent);border-color:var(--accent)}
 
-/* ─── RIGHT SIDEBAR ─────────────────────────────────────────────────────── */
+/* ─── RIGHT SIDEBAR ──────────────────────────────────────── */
 .sidebar-right{
   width:var(--sidebar-right);
   background:linear-gradient(180deg,rgba(15,20,34,.78),rgba(15,20,34,.55));
@@ -773,15 +773,8 @@ body::after{
   position:relative;
   box-shadow:inset 0 0 40px rgba(124,58,237,.08);
 }
-#graph-container canvas{display:block}
-.graph-controls{position:absolute;bottom:8px;right:8px;display:flex;gap:4px}
-.gc-btn{width:26px;height:26px;border:none;background:rgba(13,15,20,.8);border:1px solid var(--border);border-radius:6px;color:var(--text2);cursor:pointer;font-size:12px;display:flex;align-items:center;justify-content:center;transition:var(--trans)}
-.gc-btn:hover{background:var(--bg3);color:var(--text)}
-.graph-legend{display:flex;flex-wrap:wrap;gap:5px;padding:5px 12px 10px}
-.legend-item{display:flex;align-items:center;gap:3px;font-size:10px;color:var(--text3)}
-.legend-dot{width:7px;height:7px;border-radius:50%}
 
-/* ─── MODAL SYSTEM ──────────────────────────────────────────────────────── */
+/* ─── MODAL SYSTEM ─────────────────────────────────────── */
 .overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:center;justify-content:center;z-index:500}
 .overlay.open{display:flex}
 .modal{background:var(--bg2);border:1px solid var(--border);border-radius:16px;padding:24px;width:460px;max-width:95vw;max-height:90vh;overflow-y:auto}
@@ -802,7 +795,7 @@ body::after{
 .modal-msg.success{color:var(--green)}
 .section-label{font-size:11px;font-weight:600;color:var(--text3);letter-spacing:.6px;text-transform:uppercase;margin:18px 0 10px}
 
-/* ─── ADMIN PANEL ───────────────────────────────────────────────────────── */
+/* ─── ADMIN PANEL ─────────────────────────────────────── */
 .admin-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:18px}
 .stat-card{background:var(--bg3);border:1px solid var(--border);border-radius:10px;padding:12px;text-align:center}
 .stat-card .stat-val{font-size:22px;font-weight:700;color:var(--accent)}
@@ -833,7 +826,7 @@ body::after{
 .show-inactive-toggle{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text2);cursor:pointer}
 .show-inactive-toggle input{cursor:pointer}
 
-/* ─── NOTIFICATIONS ─────────────────────────────────────────────────────── */
+/* ─── NOTIFICATIONS ───────────────────────────────────── */
 .notif{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:var(--bg2);border:1px solid var(--border2);border-radius:10px;padding:10px 18px;font-size:13px;z-index:3000;box-shadow:0 8px 32px rgba(0,0,0,.4);animation:slideUp .22s ease;display:none}
 .notif.show{display:block}
 .notif.success{border-color:var(--green);color:var(--green)}
@@ -841,7 +834,7 @@ body::after{
 .notif.info{border-color:var(--blue);color:var(--blue)}
 @keyframes slideUp{from{opacity:0;transform:translateX(-50%) translateY(10px)}to{opacity:1;transform:translateX(-50%) translateY(0)}}
 
-/* ─── TOOLTIP ────────────────────────────────────────────────────────────── */
+/* ─── TOOLTIP ─────────────────────────────────────────── */
 .g-tooltip{position:fixed;background:var(--bg2);border:1px solid var(--border2);border-radius:8px;padding:8px 12px;font-size:12px;pointer-events:none;z-index:2000;display:none;max-width:220px;line-height:1.5}
 
 @media(max-width:900px){.sidebar-right{display:none}:root{--sidebar-left:240px}}
@@ -1265,7 +1258,7 @@ async function savePassword() {
   } catch(e) { setModalMsg('settings-msg', e.message, 'error'); }
 }
 
-/* ═══════════════════════════ ADMIN PANEL ════════════════════════════════ */
+/* ═══════════════════════════ ADMIN PANEL ══════════════════ */
 let _adminSearchTimer = null;
 function debounceAdminSearch() {
   clearTimeout(_adminSearchTimer);
@@ -1412,7 +1405,7 @@ async function doCreateUser() {
   } catch(e) { setModalMsg('cu-msg', e.message, 'error'); }
 }
 
-/* ═══════════════════════════ AGENT PILLS ════════════════════════════════ */
+/* ═══════════════════════════ AGENT PILLS ══════════════════ */
 const AGENTS=['auto','chat','code','news','search','document','finance','research','data','writing'];
 function buildAgentPills() {
   document.getElementById('agent-pills').innerHTML = AGENTS.map(a=>
@@ -1425,7 +1418,7 @@ function selectAgent(a,el) {
   S.forcedAgent = a==='auto' ? null : a;
 }
 
-/* ═══════════════════════════ CONVERSATIONS ══════════════════════════════ */
+/* ═══════════════════════════ CONVERSATIONS ════════════════ */
 function newId() { return Math.random().toString(36).slice(2,10); }
 
 function newConversation() {
@@ -1495,7 +1488,7 @@ function renderHistory() {
   el.innerHTML = html;
 }
 
-/* ═══════════════════════════ WELCOME ════════════════════════════════════ */
+/* ═══════════════════════════ WELCOME ══════════════════════ */
 const SUGGESTIONS=['Summarise this document 📄','Today\'s top headlines 📰','Analyse my sales CSV 📊',
   'Write a blog post about AI ✍️','Apple P/E ratio? 💹','Research quantum computing 🔬'];
 function showWelcome() {
@@ -1511,7 +1504,7 @@ function useSuggestion(el) {
   sendMessage();
 }
 
-/* ═══════════════════════════ MESSAGING ══════════════════════════════════ */
+/* ═══════════════════════════ MESSAGING ═════════════════════ */
 function appendUserMsg(text, scroll=true) {
   const msgs = document.getElementById('messages');
   const w    = msgs.querySelector('.welcome');
@@ -1633,7 +1626,7 @@ function updateConvTitle(text) {
   if (c && c.title==='New conversation') {c.title=text.slice(0,48)+(text.length>48?'…':''); saveConvs(); renderHistory();}
 }
 
-/* ═══════════════════════════ RESOURCES ══════════════════════════════════ */
+/* ═══════════════════════════ RESOURCES ═════════════════════ */
 let _resTab='sources';
 function switchResTab(tab,el) {
   _resTab=tab;
@@ -1703,7 +1696,7 @@ function renderGraphTab() {
   setTimeout(()=>buildGraph(S.lastRefs),50);
 }
 
-/* ═══════════════════════════ 3D GRAPH ═══════════════════════════════════ */
+/* ═══════════════════════════ 3D GRAPH ═════════════════════ */
 let _scene,_cam,_ren,_animId,_autoRot=true,_theta=0.3,_phi=0.9,_rad=6,_drag=false,_lm={x:0,y:0},_mx={x:0,y:0};
 const _COLORS=[0x6c63ff,0x22c55e,0xf59e0b,0x38bdf8,0xef4444,0xa78bfa,0xfb923c,0x34d399];
 
@@ -1776,7 +1769,7 @@ function updateCam(){if(!_cam)return;_cam.position.set(_rad*Math.sin(_phi)*Math.
 function resetCam(){_theta=0.3;_phi=0.9;_rad=5.5;updateCam();}
 function toggleRot(){_autoRot=!_autoRot;document.getElementById('rot-btn').style.color=_autoRot?'var(--accent)':'var(--text2)';}
 
-/* ═══════════════════════════ SIDEBAR TOGGLES ═══════════════════════════ */
+/* ═══════════════════════════ SIDEBAR TOGGLES ══════════════ */
 function toggleLeftSidebar()  {document.getElementById('sidebar-left').classList.toggle('collapsed');}
 function toggleRightSidebar() {document.getElementById('sidebar-right').classList.toggle('collapsed');}
 function toggleRag() {
@@ -1785,7 +1778,7 @@ function toggleRag() {
   notify('RAG pre-check '+(S.ragEnabled?'ON':'OFF'));
 }
 
-/* ═══════════════════════════ FILE UPLOAD ════════════════════════════════ */
+/* ═══════════════════════════ FILE UPLOAD ══════════════════ */
 async function doUpload() {
   const file=document.getElementById('upload-file').files[0];
   const status=document.getElementById('upload-status');
@@ -1800,7 +1793,7 @@ async function doUpload() {
   } catch(e){status.textContent='Upload failed: '+e.message;}
 }
 
-/* ═══════════════════════════ UTILS ═════════════════════════════════════ */
+/* ═══════════════════════════ UTILS ════════════════════════ */
 function v(id){return document.getElementById(id)?.value.trim()||'';}
 function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 function md(s){try{return marked.parse(String(s||''),{breaks:true,gfm:true});}catch(e){return esc(s);}}
